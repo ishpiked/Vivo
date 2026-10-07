@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: vivarium-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    # Render injects $PORT; bind all interfaces.
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/servers
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      # Paste a fresh `vg` cookie from your browser (DevTools > Application >
+      # Cookies > vivarium.su). ~30d validity; the API keeps serving on it
+      # until upstream 403s. Set sync:false so the value is entered in the
+      # Render dashboard, never committed to git.
+      - key: VIVARIUM_VG
+        sync: false
