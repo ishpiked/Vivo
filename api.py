@@ -42,6 +42,8 @@ from vivcrypto import VIV, HEADERS
 
 _CACHE = {}  # (id,type,s,e,server,dub,provider,race) -> (at, result); TTL 120s
 _CACHE_TTL = 120
+_UPSTREAM_CACHE = {}
+_UPSTREAM_CACHE_TTL = 30
 
 
 def sign_request(path_qs: str):
@@ -89,22 +91,25 @@ def classify_streams(data: dict):
 def filter_streams(data: dict, dub: bool = False, provider: Optional[str] = None,
                    server: Optional[str] = None):
     streams = data.get("streams", []) or []
-    if server:
-        server = server.lower()
-        if server == "aster":
-            streams = [x for x in streams if is_dub(x)]
-        elif server == "vexa":
-            streams = [x for x in streams if not is_dub(x)]
-    elif dub:
-        streams = [x for x in streams if is_dub(x)]
-    if provider:
-        streams = [x for x in streams if (x.get("provider") or "").lower() == provider.lower()]
-    if server and server.lower() == "vexa":
-        # Subtitled streams first: a vexa pick without subs is a broken pick.
-        streams = sorted(streams, key=lambda x: (bool(x.get("subs")), x.get("rank", 0)),
-                         reverse=True)
-    return {"streams": streams, "subtitles": data.get("subtitles", []),
-            "qualities": quality_list(streams)}
+    server_key = (server or "").lower()
+    provider_key = (provider or "").lower()
+
+    filtered = []
+    for item in streams:
+        if server_key == "aster" and not is_dub(item):
+            continue
+        if server_key == "vexa" and is_dub(item):
+            continue
+        elif not server_key and dub and not is_dub(item):
+            continue
+        if provider_key and (item.get("provider") or "").lower() != provider_key:
+            continue
+        filtered.append(item)
+
+    if server_key == "vexa":
+        filtered.sort(key=lambda x: (bool(x.get("subs")), x.get("rank", 0)), reverse=True)
+    return {"streams": filtered, "subtitles": data.get("subtitles", []),
+            "qualities": quality_list(filtered)}
 
 
 def parse_quality(s: dict) -> dict:
@@ -138,6 +143,20 @@ def wants_for(server_or_dub, s: dict) -> bool:
     if server_or_dub in ("vexa",):
         return not is_dub(s) and bool(s.get("subs"))
     return True
+
+
+def _cached_upstream(path_qs: str, headers: dict, timeout: int = 20):
+    cache_key = (path_qs, tuple(sorted(headers.items())), timeout)
+    now = time.monotonic()
+    entry = _UPSTREAM_CACHE.get(cache_key)
+    if entry and now - entry[0] < _UPSTREAM_CACHE_TTL:
+        return entry[1]
+    r = vc.S.get(f"{VIV}{path_qs}", headers=headers, timeout=timeout)
+    if r.status_code != 200:
+        raise RuntimeError(f"Upstream fetch failed: {r.status_code}")
+    payload = r.json()
+    _UPSTREAM_CACHE[cache_key] = (now, payload)
+    return payload
 
 
 def race_streams(path_qs: str, server_or_dub, timeout: int = 25):
@@ -269,24 +288,23 @@ def vivarium(
     key = (id, type, s, e, (server or "").lower(), bool(dub),
            (provider or "").lower(), bool(race))
     hit = _CACHE.get(key)
-    if hit and time.time() - hit[0] < _CACHE_TTL:
+    if hit and time.monotonic() - hit[0] < _CACHE_TTL:
         res = dict(hit[1])
         res["cached"] = True
         return {"status": 200, "result": res}
     if race:
-        # Parallel race: first sub-server link that fits wins (fastest play).
         won = race_streams(path, server.lower() if server else (True if dub else None))
         if won:
             res = filter_streams({"streams": [won], "subtitles": []}, dub, provider, server)
-            _CACHE[key] = (time.time(), res)
+            _CACHE[key] = (time.monotonic(), res)
             return {"status": 200, "result": res}
-        # Race missed (slow round): fall back to the full background list.
     _, headers, _ = sign_request(path)
-    r = vc.S.get(f"{VIV}{path}", headers=headers, timeout=30)
-    if r.status_code != 200:
-        return {"status": r.status_code, "result": "", "error": "Upstream fetch failed"}
-    res = filter_streams(r.json(), dub, provider, server)
-    _CACHE[key] = (time.time(), res)
+    try:
+        payload = _cached_upstream(path, headers, timeout=20)
+    except RuntimeError as ex:
+        return {"status": 502, "result": "", "error": str(ex)}
+    res = filter_streams(payload, dub, provider, server)
+    _CACHE[key] = (time.monotonic(), res)
     return {"status": 200, "result": res}
 
 

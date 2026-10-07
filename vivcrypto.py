@@ -445,21 +445,42 @@ def _vg_maintainer():
 # ---------------- shared signing -------------
 _NONCES = []
 _NONCES_DATE = {"date": None}
+_NONCES_LOCK = threading.Lock()
+
+
+def _load_nonce_batch():
+    global _NONCES_DATE
+    r = S.get(f"{VIV}/api/n", timeout=10)
+    if r.status_code == 403:
+        if not ensure_vg():
+            raise RuntimeError("vg expired and browser refresh unavailable; "
+                               "set VIVARIUM_VG in .env (local) or Render dashboard, "
+                               "or POST /api/admin/vg with a fresh vg cookie")
+        r = S.get(f"{VIV}/api/n", timeout=10)
+    r.raise_for_status()
+    payload = r.json()
+    if not isinstance(payload, list) or not payload:
+        raise RuntimeError("empty nonce payload from /api/n")
+    with _NONCES_LOCK:
+        _NONCES.extend(payload)
+        _NONCES_DATE["date"] = r.headers.get("Date")
+
+
+def _warm_nonce_pool(target=12):
+    try:
+        while len(_NONCES) < target:
+            _load_nonce_batch()
+    except Exception:
+        pass
 
 
 def sign(path_qs: str):
-    while not _NONCES:
-        r = S.get(f"{VIV}/api/n", timeout=10)
-        if r.status_code == 403:
-            if not ensure_vg():
-                raise RuntimeError("vg expired and browser refresh unavailable; "
-                                   "set VIVARIUM_VG in .env (local) or Render dashboard, "
-                                   "or POST /api/admin/vg with a fresh vg cookie")
-            continue
-        r.raise_for_status()
-        _NONCES.extend(r.json())
-        _NONCES_DATE["date"] = r.headers.get("Date")
-    nonce = _NONCES.pop(0)
+    while True:
+        with _NONCES_LOCK:
+            if _NONCES:
+                nonce = _NONCES.pop(0)
+                break
+        _load_nonce_batch()
     l = 0
     try:
         ds = _NONCES_DATE["date"]
@@ -479,4 +500,5 @@ def is_dub(s: dict) -> bool:
 
 
 bootstrap_background()
+threading.Thread(target=lambda: (_warm_nonce_pool(), None), daemon=True).start()
 threading.Thread(target=_vg_maintainer, daemon=True).start()
