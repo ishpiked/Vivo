@@ -1,12 +1,12 @@
 # Vivarium API
 
-A self-hosted companion API for vivarium.su, shaped like enc-dec.app (which only covers cinejoy). It signs requests the same way the site's own frontend does, fetches stream links across all providers in the background, and presents them through two foreground servers: Aster for English dub anime, Vexa for Japanese audio with subtitles.
+A self-hosted companion API for vivarium.su, shaped like enc-dec.app (which only covers cinejoy). It signs requests the same way the site's own frontend does, fetches stream links across all providers in the background, and presents them through two foreground servers: Aster for English dub anime, Vexa for Japanese audio with English subtitles.
 
 ## What it does
 
 - Signs vivarium.su API calls (nonce + timestamp + WASM signature), so clients never touch the site's protection directly.
 - One-shot stream lookup by TMDB id (movies/series) or internal id (anime).
-- Parallel sub-server race: first provider link that fits wins, with full-list fallback.
+- Parallel provider race: return the first matching link without waiting for a full-list fetch.
 - Parsed quality tables on every result (label, height, provider, dub/hevc/hdr flags).
 - HLS links only. Video bytes always stream straight from vivarium's CDNs, never through this API, so hosting it costs almost no bandwidth.
 
@@ -21,7 +21,7 @@ returns HTTP 404 and `code: "no_sources"`.
 | GET | `/health` | Lightweight local health check; no upstream request. |
 | GET | `/api/servers` | Foreground servers: Aster, Vexa |
 | GET | `/api/health-vivarium` | All background providers and their status |
-| GET | `/api/vivarium?id=&type=&s=&e=&server=&race=` | One-shot lookup. `type` is `movie` or `tv`; `s`/`e` are season/episode for tv. `server` is `aster` or `vexa`. `race=true` (default) returns the first fitting link; `race=false` returns the full source list. |
+| GET | `/api/vivarium?id=&type=&s=&e=&server=&race=` | One-shot lookup. `type` is `movie` or `tv`; `s`/`e` are season/episode for tv. `server` is `aster` or `vexa`. `race=true` (default) returns the first fitting link and does not fall back to a slower full-list fetch; `race=false` returns the full source list. |
 | GET | `/api/enc-vivarium?id=&type=&s=&e=` | **Password protected.** Signed request kit (`path`, `headers`, `cookies`, `url`); this includes the VG cookie. |
 | POST | `/api/dec-vivarium` | Filter a raw `/api/e` response: `{"response": {...}, "dub": false, "provider": null, "server": null}` |
 | GET | `/api/status` | Dashboard summary: uptime, request/lookup counters, caches, signing/bootstrap readiness. |

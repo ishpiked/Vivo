@@ -10,7 +10,8 @@ background. See GET /api/admin/status.
 Endpoints:
   GET  /api/health-vivarium            -> providers (like wing.st/servers)
   GET  /api/servers                    -> FOREGROUND servers: Aster (english dub
-                                          anime) + Vexa (japanese audio anime).
+                                          anime) + Vexa (japanese audio anime
+                                          with English subtitles).
                                           All real providers still run in the
                                           background; only these two are shown.
   GET  /api/enc-vivarium?id=&type=&s=&e=
@@ -170,7 +171,7 @@ SERVERS = [
     {"server": "Aster", "audio": "dub",
      "description": "English dub anime"},
     {"server": "Vexa", "audio": "japanese",
-     "description": "Japanese audio anime with subtitles"},
+     "description": "Japanese audio anime with English subtitles"},
 ]
 
 
@@ -178,12 +179,27 @@ def is_dub(s: dict) -> bool:
     return "dub" in (s.get("quality") or "").lower()
 
 
+def has_english_subtitles(stream: dict) -> bool:
+    subtitles = stream.get("subs")
+    if not isinstance(subtitles, list):
+        return False
+    for subtitle in subtitles:
+        if not isinstance(subtitle, dict):
+            continue
+        labels = " ".join(str(subtitle.get(key) or "")
+                          for key in ("lang", "language", "label"))
+        if re.search(r"\b(?:english|eng|en)\b", labels, re.I):
+            return True
+    return False
+
+
 def classify_streams(data: dict):
     """Split background provider streams into the two foreground servers."""
     streams = data.get("streams", []) or []
     aster = sorted([x for x in streams if is_dub(x)],
                    key=lambda x: x.get("rank", 0), reverse=True)
-    vexa = sorted([x for x in streams if not is_dub(x)],
+    vexa = sorted([x for x in streams
+                   if not is_dub(x) and has_english_subtitles(x)],
                   key=lambda x: (bool(x.get("subs")), x.get("rank", 0)),
                   reverse=True)
     return {"aster": aster, "vexa": vexa}
@@ -199,7 +215,8 @@ def filter_streams(data: dict, dub: bool = False, provider: Optional[str] = None
     for item in streams:
         if server_key == "aster" and not is_dub(item):
             continue
-        if server_key == "vexa" and is_dub(item):
+        if server_key == "vexa" and (
+                is_dub(item) or not has_english_subtitles(item)):
             continue
         elif not server_key and dub and not is_dub(item):
             continue
@@ -242,7 +259,7 @@ def wants_for(server_or_dub, s: dict) -> bool:
     if server_or_dub in ("aster", True):
         return is_dub(s)
     if server_or_dub in ("vexa",):
-        return not is_dub(s) and bool(s.get("subs"))
+        return not is_dub(s) and has_english_subtitles(s)
     return True
 
 
@@ -518,6 +535,9 @@ async def vivarium(
             timings["response_generation"] = (time.perf_counter() - started) * 1000
             _log_timing(timings)
             return result
+        _record_lookup(True)
+        _log_timing(timings)
+        return _no_sources_response()
     try:
         payload = await _cached_upstream(client, path, timings)
     except (RuntimeError, httpx.HTTPError) as ex:
