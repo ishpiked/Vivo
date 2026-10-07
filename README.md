@@ -60,4 +60,4 @@ Notes: Render disks are ephemeral, so `VIVARIUM_VG` in the dashboard is the sour
 
 ## License
 
-MIT. Replace `[Your Name]` in `LICENSE` with your own before publishing.
+MIT. Replace `ishpiked` in `LICENSE` with your own before publishing.
