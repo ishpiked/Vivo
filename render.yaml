@@ -16,3 +16,5 @@ services:
       # Render dashboard, never committed to git.
       - key: VIVARIUM_VG
         sync: false
+      - key: VIVARIUM_ADMIN_PASSWORD
+        sync: false

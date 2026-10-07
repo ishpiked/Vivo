@@ -22,14 +22,14 @@ returns HTTP 404 and `code: "no_sources"`.
 | GET | `/api/servers` | Foreground servers: Aster, Vexa |
 | GET | `/api/health-vivarium` | All background providers and their status |
 | GET | `/api/vivarium?id=&type=&s=&e=&server=&race=` | One-shot lookup. `type` is `movie` or `tv`; `s`/`e` are season/episode for tv. `server` is `aster` or `vexa`. `race=true` (default) returns the first fitting link; `race=false` returns the full source list. |
-| GET | `/api/enc-vivarium?id=&type=&s=&e=` | Signed request kit (`path`, `headers`, `cookies`, `url`). Fetch it yourself, like `enc-cinejoy`. |
+| GET | `/api/enc-vivarium?id=&type=&s=&e=` | **Password protected.** Signed request kit (`path`, `headers`, `cookies`, `url`); this includes the VG cookie. |
 | POST | `/api/dec-vivarium` | Filter a raw `/api/e` response: `{"response": {...}, "dub": false, "provider": null, "server": null}` |
 | GET | `/api/status` | Dashboard summary: uptime, request/lookup counters, caches, signing/bootstrap readiness. |
 | GET | `/api/status/metrics` | Request totals by route and HTTP status, latency summary, empty lookup count. |
 | GET | `/api/status/cache` | Cache sizes, entry cap, and TTLs. |
 | GET | `/api/status/crypto` | Signing readiness, nonce pool size, VG expiry, and bootstrap state (no credential values). |
-| GET | `/api/admin/status` | Key sources, `vg` expiry, bootstrap state |
-| POST | `/api/admin/vg` | Hot-swap the `vg` cookie: `{"vg": "..."}`. No restart; currently unauthenticated, so use only in a trusted environment. |
+| GET | `/api/admin/status` | **Password protected.** Key sources, `vg` expiry, bootstrap state. |
+| POST | `/api/admin/vg` | **Password protected.** Hot-swap the `vg` cookie: `{"vg": "..."}`. No restart required. |
 
 The dashboard endpoints expose process-local counters and cache state; values
 reset when the service restarts. `/api/health-vivarium` separately checks the
@@ -37,7 +37,20 @@ upstream provider health and can take as long as the upstream request.
 `/api/status` is local-only and does not make an upstream request. Its
 `state` is `ready` only when the signing material and WASM are present and the
 known VG expiry has not passed; it does not promise that Vivarium's providers
-are currently returning streams.
+are currently returning streams. General health and dashboard endpoints remain
+public; endpoints that expose the VG cookie or manage admin credentials require
+the admin password.
+
+Set `VIVARIUM_ADMIN_PASSWORD` in the service environment before using the
+protected endpoints. Send it only in the HTTP `Authorization` header using
+the `Bearer` scheme over HTTPS; never pass it as a query parameter or request
+body. Set the value in Render's environment settings to the password supplied
+for this deployment, or in the ignored local `.env` file for local development.
+
+Requests without the correct token receive HTTP `401`. If the environment
+variable is unset, protected endpoints fail closed with HTTP `503`. The
+password is not stored in source control; use Render's environment settings
+(the Blueprint declares it as `sync: false`) or the ignored local `.env` file.
 
 If no matching HLS stream with an HTTP(S) URL is available, `/api/vivarium` and
 `/api/dec-vivarium` return HTTP `404` with `code: "no_sources"` and a
@@ -72,10 +85,10 @@ When VG expires or `/api/status/crypto` reports nonce/bootstrap failures:
    committed file.
 3. **Recommended for Render:** update the `VIVARIUM_VG` environment variable
    in the Render service settings and redeploy/restart the service.
-4. For a running service, `POST /api/admin/vg` also hot-swaps the value. This
-   endpoint currently has no authentication: use it only in a trusted/private
-   environment. Do not expose it to untrusted clients; prefer the Render
-   dashboard setting for the public service.
+4. For a running service, `POST /api/admin/vg` also hot-swaps the value.
+   Send the admin password using the HTTP `Authorization` header with the
+   `Bearer` scheme over HTTPS. Prefer the Render dashboard setting for routine
+   cookie updates.
 5. Confirm `/api/status/crypto` shows a future VG expiry and a healthy nonce
    pool. Retry the requested title. A 403 or `no_sources` can also indicate a
    Vivarium/provider outage, not necessarily an expired cookie.
@@ -156,7 +169,8 @@ pinning implementation-only transitive packages such as `pydantic-core` or
 1. Push this folder to GitHub (take `api.py`, `vivcrypto.py`, `requirements.txt`, `render.yaml`, `.gitignore`, `LICENSE`; `smooth.py` / `vivarium.py` are local player scripts and optional).
 2. Render, New, Web Service, connect the repo (set Root Directory to this folder if it is not the repo root).
 3. Build: `pip install -r requirements.txt`. Start: `uvicorn api:app --host 0.0.0.0 --port $PORT`. Or deploy the included `render.yaml` as a Blueprint.
-4. Env vars: `PYTHON_VERSION=3.11.9`, `VIVARIUM_VG=<paste the cookie>`.
+4. Env vars: `PYTHON_VERSION=3.11.9`, `VIVARIUM_VG=<paste the cookie>`, and
+   `VIVARIUM_ADMIN_PASSWORD=<choose a strong password>`.
    If creating the service manually instead of from `render.yaml`, set these
    in **Settings → Environment**; the Blueprint file is not applied.
 5. Verify `/health`, `/api/status`, and `/api/status/crypto`.
@@ -171,8 +185,10 @@ Notes: Render disks are ephemeral, so `VIVARIUM_VG` in the dashboard is the
 source of truth. The native Python runtime has no Chrome, so browser
 auto-refresh stays dormant there. If the cookie expires, update `VIVARIUM_VG`
 in Render settings and redeploy/restart; avoid the unauthenticated
-`POST /api/admin/vg` on a public service. Responses cache for 30s, which keeps
-upstream load (and latency on repeats) low without holding HLS links as long.
+`POST /api/admin/vg` on a public service without its bearer password. The
+signed request-kit endpoint `/api/enc-vivarium` is also protected because its
+response contains the VG cookie. Responses cache for 30s, which keeps upstream
+load (and latency on repeats) low without holding HLS links as long.
 Lookup requests reuse a pooled async HTTP client and negotiate HTTP/2 when the
 upstream supports it. Set the `vivarium.performance` logger to `INFO` to record
 per-stage `scrape_timing_ms` measurements (upstream request, parsing, source

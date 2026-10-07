@@ -15,6 +15,7 @@ Endpoints:
                                           background; only these two are shown.
   GET  /api/enc-vivarium?id=&type=&s=&e=
        -> {"path","headers","cookies"} signed request kit (like enc-cinejoy data+state).
+          Requires the admin bearer password because the kit includes the VG cookie.
           Client then GETs https://vivarium.su<path> themselves.
   POST /api/dec-vivarium  {"response": <raw /api/e JSON>, "dub": bool, "provider": str|None, "server": "aster"|"vexa"|None}
        -> {"streams":[...],"subtitles":[...],"qualities":[...]} filtered (like dec-cinejoy).
@@ -22,8 +23,8 @@ Endpoints:
        -> one-shot convenience: race=true (default) returns the first matching
           HLS source from the parallel provider event stream. race=false fetches
           the complete list when all qualities/sources are required.
-  GET  /api/admin/status               -> key sources, vg expiry, bootstrap state
-  POST /api/admin/vg {"vg": "..."}     -> hot-swap VG cookie (no restart)
+  GET  /api/admin/status               -> key sources, vg expiry, bootstrap state (protected)
+  POST /api/admin/vg {"vg": "..."}     -> hot-swap VG cookie (protected; no restart)
 
 Run: uvicorn api:app --port 8000
 Requires: pip install fastapi uvicorn wasmtime requests
@@ -31,7 +32,9 @@ Optional for VG auto-refresh: pip install seleniumbase (needs Chrome)
 """
 import asyncio
 import datetime
+import hmac
 import logging
+import os
 import re
 import threading
 import time
@@ -39,7 +42,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -78,6 +81,25 @@ _METRICS = {
 
 def sign_request(path_qs: str):
     return path_qs, vc.sign(path_qs), {"vg": vc.VG}
+
+
+def require_admin(request: Request):
+    password = os.environ.get("VIVARIUM_ADMIN_PASSWORD")
+    if not password:
+        raise HTTPException(
+            status_code=503, detail="Admin access is not configured")
+
+    scheme, separator, credential = request.headers.get(
+        "authorization", "").partition(" ")
+    if (not separator or scheme.lower() != "bearer"
+            or not hmac.compare_digest(
+                credential.strip().encode("utf-8"),
+                password.encode("utf-8"))):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing admin password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 def _cache_get(cache, key, ttl):
@@ -390,7 +412,7 @@ async def health_vivarium(request: Request):
     return {"status": 200, "result": response.json()}
 
 
-@app.get("/api/enc-vivarium")
+@app.get("/api/enc-vivarium", dependencies=[Depends(require_admin)])
 def enc_vivarium(
     id: Optional[str] = Query(None),
     type: Optional[str] = Query(None),
@@ -617,7 +639,7 @@ def api_status_crypto():
     }}
 
 
-@app.get("/api/admin/status")
+@app.get("/api/admin/status", dependencies=[Depends(require_admin)])
 def admin_status():
     exp = vc._VG_EXPIRY["at"]
     return {"status": 200, "result": {
@@ -630,7 +652,7 @@ def admin_status():
     }}
 
 
-@app.post("/api/admin/vg")
+@app.post("/api/admin/vg", dependencies=[Depends(require_admin)])
 def admin_vg(body: AdminVgBody):
     if not body.vg or len(body.vg.strip()) < 20:
         return {"status": 400, "result": "", "error": "Expected body: vg",
