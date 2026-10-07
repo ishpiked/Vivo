@@ -79,12 +79,12 @@ Notes: Render disks are ephemeral, so `VIVARIUM_VG` in the dashboard is the sour
 
 ## Files
 
-- `api.py` - the FastAPI service described above. This is the only file the
-  Render deployment needs (plus `vivcrypto.py`).
-- `vivcrypto.py` - shared signing core: WASM signer, nonce pool, key bootstrap + refresh, used by everything else.
-- `smooth.py` - local smooth player: parallel HLS mirror + mpv, `--server aster|vexa`, `--quality best|720p|...`. Runs on your own machine. Heavy on bandwidth by design.
-- `vivarium.py` - minimal local lookup script in the same style as the cinejoy sample.
+- `api.py` - the FastAPI service described above.
+- `vivcrypto.py` - shared signing core: WASM signer, nonce pool, key bootstrap + refresh.
+- `requirements.txt`, `render.yaml` - Render deploy surface.
+- `player/` (local only, not pushed) - smooth player and lookup script. Heavy
+  playback runs on your own machine; the API only hands out links.
 
 ## License
 
-MIT. Replace `ishpiked` in `LICENSE` with your own before publishing.
+MIT (c) spike. See `LICENSE`.
