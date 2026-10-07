@@ -9,4 +9,5 @@ annotated-types==0.8.0
 typing-extensions==4.16.0
 wasmtime==49.0.0
 requests==2.32.3
+httpx[http2]==0.28.1
 cryptography==42.0.8

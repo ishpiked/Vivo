@@ -18,7 +18,7 @@ All responses use the enc-dec.app envelope: `{"status": 200, "result": {...}}`.
 | ------ | ---- | ------- |
 | GET | `/api/servers` | Foreground servers: Aster, Vexa |
 | GET | `/api/health-vivarium` | All background providers and their status |
-| GET | `/api/vivarium?id=&type=&s=&e=&server=&race=` | One-shot lookup. `type` is `movie` or `tv`; `s`/`e` are season/episode for tv. `server` is `aster` or `vexa`. `race=true` takes the fastest fitting link. |
+| GET | `/api/vivarium?id=&type=&s=&e=&server=&race=` | One-shot lookup. `type` is `movie` or `tv`; `s`/`e` are season/episode for tv. `server` is `aster` or `vexa`. `race=true` (default) returns the first fitting link; `race=false` returns the full source list. |
 | GET | `/api/enc-vivarium?id=&type=&s=&e=` | Signed request kit (`path`, `headers`, `cookies`, `url`). Fetch it yourself, like `enc-cinejoy`. |
 | POST | `/api/dec-vivarium` | Filter a raw `/api/e` response: `{"response": {...}, "dub": false, "provider": null, "server": null}` |
 | GET | `/api/admin/status` | Key sources, `vg` expiry, bootstrap state |
@@ -75,13 +75,43 @@ No keys live in the code. `.env` and `.vivcrypto.json` are git-ignored. `U_HEX` 
 4. Env vars: `PYTHON_VERSION=3.11.9`, `VIVARIUM_VG=<paste the cookie>`. Note: if you created the service by hand in the dashboard instead of from `render.yaml`, the file is ignored, so set both vars in Settings, Environment by hand. Pins in `requirements.txt` all ship Python 3.14 wheels too, so a 3.14 image also builds.
 5. Verify `/api/servers` and `/api/admin/status`.
 
-Notes: Render disks are ephemeral, so `VIVARIUM_VG` in the dashboard is the source of truth. The native Python runtime has no Chrome, so browser auto-refresh stays dormant there; if the cookie dies, `POST /api/admin/vg` with a fresh one, no redeploy. Responses cache for 120s, which keeps upstream load (and latency on repeats) low.
+Notes: Render disks are ephemeral, so `VIVARIUM_VG` in the dashboard is the source of truth. The native Python runtime has no Chrome, so browser auto-refresh stays dormant there; if the cookie dies, `POST /api/admin/vg` with a fresh one, no redeploy. Responses cache for 30s, which keeps upstream load (and latency on repeats) low without holding HLS links as long.
+Lookup requests reuse a pooled async HTTP client and negotiate HTTP/2 when the
+upstream supports it. Set the `vivarium.performance` logger to `INFO` to record
+per-stage `scrape_timing_ms` measurements (upstream request, parsing, source
+extraction, search-to-source, and response generation) plus end-to-end
+`scrape_response_ms`. `race=true` (the default) consumes the upstream event
+stream and returns the first matching HLS source; set `race=false` when the
+complete quality/source list is required. The upstream already supplies direct HLS URLs, so the API
+returns a fitting URL immediately without a HEAD/playlist probe that would add
+another network round trip.
+
+### Keeping a free Render service warm
+
+Render Free web services spin down after 15 minutes without inbound traffic.
+This repository includes a GitHub Actions scheduled health check that requests
+`/health` every 10 minutes:
+
+1. Push the workflow to the repository's default branch.
+2. In GitHub, open **Settings → Secrets and variables → Actions → Variables**
+   and create `RENDER_HEALTH_URL` with the service's base URL, for example
+   `https://your-service.onrender.com` (no trailing slash is required).
+3. Confirm **Actions** are enabled for the repository. You can also run
+   **Keep Render service warm → Run workflow** once to check the configuration.
+
+This is a best-effort keep-warm check, not an uptime guarantee. GitHub scheduled
+workflows can be delayed or disabled, and Render can restart free services at
+any time. A free service that stays running also uses the workspace's 750 free
+instance hours per calendar month; those hours are shared across its free
+services. Keeping it continuously available beyond Render's free-tier limits
+requires a paid Render instance or a host with an always-on free tier.
 
 ## Files
 
 - `api.py` - the FastAPI service described above.
 - `vivcrypto.py` - shared signing core: WASM signer, nonce pool, key bootstrap + refresh.
 - `requirements.txt`, `render.yaml` - Render deploy surface.
+- `.github/workflows/render-keepalive.yml` - scheduled health check for Render Free.
 - `player/` (local only, not pushed) - smooth player and lookup script. Heavy
   playback runs on your own machine; the API only hands out links.
 

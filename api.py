@@ -19,10 +19,9 @@ Endpoints:
   POST /api/dec-vivarium  {"response": <raw /api/e JSON>, "dub": bool, "provider": str|None, "server": "aster"|"vexa"|None}
        -> {"streams":[...],"subtitles":[...],"qualities":[...]} filtered (like dec-cinejoy).
   GET  /api/vivarium?id=&type=&s=&e=&dub=&provider=&server=&race=
-       -> one-shot convenience: server signs+fetches the FULL provider list in
-          the background, classifies into Aster/Vexa, returns the chosen
-          foreground server's streams. race=true takes the first sub-server
-          link that fits instead of waiting for all.
+       -> one-shot convenience: race=true (default) returns the first matching
+          HLS source from the parallel provider event stream. race=false fetches
+          the complete list when all qualities/sources are required.
   GET  /api/admin/status               -> key sources, vg expiry, bootstrap state
   POST /api/admin/vg {"vg": "..."}     -> hot-swap VG cookie (no restart)
 
@@ -30,9 +29,17 @@ Run: uvicorn api:app --port 8000
 Requires: pip install fastapi uvicorn wasmtime requests
 Optional for VG auto-refresh: pip install seleniumbase (needs Chrome)
 """
+import asyncio
+import logging
 import re
+import threading
 import time
+from collections import OrderedDict
+from contextlib import asynccontextmanager
+
+import httpx
 from fastapi import FastAPI, Query
+from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -40,14 +47,43 @@ from typing import Optional
 import vivcrypto as vc
 from vivcrypto import VIV, HEADERS
 
-_CACHE = {}  # (id,type,s,e,server,dub,provider,race) -> (at, result); TTL 120s
-_CACHE_TTL = 120
-_UPSTREAM_CACHE = {}
+_LOG = logging.getLogger("vivarium.performance")
+_CACHE = OrderedDict()  # (id,type,s,e,server,dub,provider,race) -> (at, result)
+_CACHE_TTL = 30
+_UPSTREAM_CACHE = OrderedDict()  # path -> (at, payload)
 _UPSTREAM_CACHE_TTL = 30
+_CACHE_LIMIT = 512
+_CACHE_LOCK = threading.Lock()
 
 
 def sign_request(path_qs: str):
     return path_qs, vc.sign(path_qs), {"vg": vc.VG}
+
+
+def _cache_get(cache, key, ttl):
+    now = time.monotonic()
+    with _CACHE_LOCK:
+        entry = cache.get(key)
+        if entry is None:
+            return None
+        if now - entry[0] >= ttl:
+            del cache[key]
+            return None
+        cache.move_to_end(key)
+        return entry[1]
+
+
+def _cache_put(cache, key, value):
+    with _CACHE_LOCK:
+        cache[key] = (time.monotonic(), value)
+        cache.move_to_end(key)
+        while len(cache) > _CACHE_LIMIT:
+            cache.popitem(last=False)
+
+
+def _log_timing(stages):
+    _LOG.info("scrape_timing_ms %s", " ".join(
+        f"{name}={value:.2f}" for name, value in stages.items()))
 
 
 class AdminVgBody(BaseModel):
@@ -145,56 +181,102 @@ def wants_for(server_or_dub, s: dict) -> bool:
     return True
 
 
-def _cached_upstream(path_qs: str, headers: dict, timeout: int = 20):
-    cache_key = (path_qs, tuple(sorted(headers.items())), timeout)
-    now = time.monotonic()
-    entry = _UPSTREAM_CACHE.get(cache_key)
-    if entry and now - entry[0] < _UPSTREAM_CACHE_TTL:
-        return entry[1]
-    r = vc.S.get(f"{VIV}{path_qs}", headers=headers, timeout=timeout)
-    if r.status_code != 200:
-        raise RuntimeError(f"Upstream fetch failed: {r.status_code}")
-    payload = r.json()
-    _UPSTREAM_CACHE[cache_key] = (now, payload)
+async def _cached_upstream(client, path_qs: str, timings: dict):
+    cache_started = time.perf_counter()
+    payload = _cache_get(_UPSTREAM_CACHE, path_qs, _UPSTREAM_CACHE_TTL)
+    timings["upstream_cache_lookup"] = (time.perf_counter() - cache_started) * 1000
+    if payload is not None:
+        return payload
+
+    _, headers, cookies = await asyncio.to_thread(sign_request, path_qs)
+    started = time.perf_counter()
+    response = await client.get(
+        f"{VIV}{path_qs}", headers=headers, cookies=cookies,
+        timeout=httpx.Timeout(connect=5, read=20, write=5, pool=5))
+    timings["request"] = (time.perf_counter() - started) * 1000
+    if response.status_code != 200:
+        raise RuntimeError(f"Upstream fetch failed: {response.status_code}")
+
+    started = time.perf_counter()
+    payload = response.json()
+    timings["parse"] = (time.perf_counter() - started) * 1000
+    _cache_put(_UPSTREAM_CACHE, path_qs, payload)
     return payload
 
 
-def race_streams(path_qs: str, server_or_dub, timeout: int = 25):
+async def race_streams(client, path_qs: str, server_or_dub, provider, timings: dict):
     """Parallel sub-server race: /api/es fans out to every provider at once,
     first `source` event fitting the foreground server wins the playback."""
     import json
     es_qs = path_qs.replace("/api/e", "/api/es", 1)
-    _, headers, _ = sign_request(es_qs)
-    r = vc.S.get(f"{VIV}{es_qs}", headers=headers,
-                  timeout=timeout, stream=True)
-    buf = ""
-    try:
-        for chunk in r.iter_content(chunk_size=1024, decode_unicode=True):
-            if not chunk:
-                continue
-            buf += chunk
-            while "\n\n" in buf:
-                evt, buf = buf.split("\n\n", 1)
-                if "event: source" not in evt:
-                    if "event: done" in evt:
-                        return None
-                    continue
-                for line in evt.split("\n"):
-                    if not line.startswith("data:"):
-                        continue
+    _, headers, cookies = await asyncio.to_thread(sign_request, es_qs)
+    request_started = time.perf_counter()
+    async with client.stream(
+            "GET", f"{VIV}{es_qs}", headers=headers, cookies=cookies) as response:
+        timings["request"] = (time.perf_counter() - request_started) * 1000
+        if response.status_code != 200:
+            raise RuntimeError(f"Upstream search failed: {response.status_code}")
+
+        event_name = ""
+        data_lines = []
+        async for line in response.aiter_lines():
+            if line.startswith("event:"):
+                event_name = line[6:].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].lstrip())
+            elif not line:
+                if event_name == "done":
+                    timings["search"] = (
+                        time.perf_counter() - request_started) * 1000
+                    return None
+                if event_name == "source" and data_lines:
+                    started = time.perf_counter()
                     try:
-                        d = json.loads(line[5:].strip())
-                    except Exception:
-                        continue
-                    for s in d.get("streams", []):
-                        if wants_for(server_or_dub, s):
-                            return s
-    finally:
-        r.close()
+                        data = json.loads("\n".join(data_lines))
+                    except (json.JSONDecodeError, TypeError):
+                        data = {}
+                    timings["parse"] = timings.get("parse", 0.0) + (
+                        time.perf_counter() - started) * 1000
+
+                    started = time.perf_counter()
+                    for stream in data.get("streams", []) if isinstance(data, dict) else []:
+                        if (isinstance(stream, dict)
+                                and wants_for(server_or_dub, stream)
+                                and (not provider or
+                                     (stream.get("provider") or "").lower() == provider.lower())):
+                            timings["extract"] = (time.perf_counter() - started) * 1000
+                            timings["search"] = (
+                                time.perf_counter() - request_started) * 1000
+                            return stream
+                    timings["extract"] = timings.get("extract", 0.0) + (
+                        time.perf_counter() - started) * 1000
+                event_name = ""
+                data_lines = []
+    timings["search"] = (time.perf_counter() - request_started) * 1000
     return None
 
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app):
+    limits = httpx.Limits(max_connections=100, max_keepalive_connections=40,
+                          keepalive_expiry=30)
+    timeout = httpx.Timeout(connect=5, read=25, write=5, pool=5)
+    async with httpx.AsyncClient(
+            http2=True, limits=limits, timeout=timeout, headers=HEADERS) as client:
+        app.state.http = client
+        yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.middleware("http")
+async def profile_request(request: Request, call_next):
+    started = time.perf_counter()
+    response = await call_next(request)
+    if request.url.path == "/api/vivarium":
+        _LOG.info("scrape_response_ms %.2f", (time.perf_counter() - started) * 1000)
+    return response
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -224,11 +306,16 @@ def servers():
 
 
 @app.get("/api/health-vivarium")
-def health_vivarium():
-    r = vc.S.get(f"{VIV}/api/health", timeout=15)
-    if r.status_code != 200:
-        return {"status": r.status_code, "result": "", "error": "Upstream health failed"}
-    return {"status": 200, "result": r.json()}
+async def health_vivarium(request: Request):
+    try:
+        response = await request.app.state.http.get(
+            f"{VIV}/api/health", timeout=httpx.Timeout(
+                connect=5, read=15, write=5, pool=5))
+    except httpx.HTTPError as ex:
+        return {"status": 502, "result": "", "error": f"Upstream health failed: {ex}"}
+    if response.status_code != 200:
+        return {"status": response.status_code, "result": "", "error": "Upstream health failed"}
+    return {"status": 200, "result": response.json()}
 
 
 @app.get("/api/enc-vivarium")
@@ -265,7 +352,8 @@ def dec_vivarium(body: DecBody):
 
 
 @app.get("/api/vivarium")
-def vivarium(
+async def vivarium(
+    request: Request,
     id: Optional[str] = Query(None),
     type: Optional[str] = Query(None),
     s: Optional[str] = Query(None),
@@ -273,7 +361,7 @@ def vivarium(
     dub: bool = Query(False),
     provider: Optional[str] = Query(None),
     server: Optional[str] = Query(None),
-    race: bool = Query(False),
+    race: bool = Query(True),
 ):
     if not id or not type:
         return {"status": 400, "result": "", "error": "Expected query: id, type",
@@ -287,25 +375,49 @@ def vivarium(
         return {"status": 400, "result": "", "error": str(ex)}
     key = (id, type, s, e, (server or "").lower(), bool(dub),
            (provider or "").lower(), bool(race))
-    hit = _CACHE.get(key)
-    if hit and time.monotonic() - hit[0] < _CACHE_TTL:
-        res = dict(hit[1])
+    cache_started = time.perf_counter()
+    res = _cache_get(_CACHE, key, _CACHE_TTL)
+    cache_lookup_ms = (time.perf_counter() - cache_started) * 1000
+    if res is not None:
+        started = time.perf_counter()
+        res = dict(res)
         res["cached"] = True
-        return {"status": 200, "result": res}
+        result = {"status": 200, "result": res}
+        _log_timing({"cache_lookup": cache_lookup_ms,
+                     "response_generation": (time.perf_counter() - started) * 1000})
+        return result
+    timings = {"cache_lookup": cache_lookup_ms}
+    client = request.app.state.http
     if race:
-        won = race_streams(path, server.lower() if server else (True if dub else None))
+        try:
+            won = await race_streams(
+                client, path, server.lower() if server else (True if dub else None),
+                provider, timings)
+        except (httpx.HTTPError, RuntimeError) as ex:
+            return {"status": 502, "result": "", "error": str(ex)}
         if won:
+            started = time.perf_counter()
             res = filter_streams({"streams": [won], "subtitles": []}, dub, provider, server)
-            _CACHE[key] = (time.monotonic(), res)
-            return {"status": 200, "result": res}
-    _, headers, _ = sign_request(path)
+            timings["source_extraction"] = (time.perf_counter() - started) * 1000
+            _cache_put(_CACHE, key, res)
+            started = time.perf_counter()
+            result = {"status": 200, "result": res}
+            timings["response_generation"] = (time.perf_counter() - started) * 1000
+            _log_timing(timings)
+            return result
     try:
-        payload = _cached_upstream(path, headers, timeout=20)
-    except RuntimeError as ex:
+        payload = await _cached_upstream(client, path, timings)
+    except (RuntimeError, httpx.HTTPError) as ex:
         return {"status": 502, "result": "", "error": str(ex)}
+    started = time.perf_counter()
     res = filter_streams(payload, dub, provider, server)
-    _CACHE[key] = (time.monotonic(), res)
-    return {"status": 200, "result": res}
+    timings["source_extraction"] = (time.perf_counter() - started) * 1000
+    _cache_put(_CACHE, key, res)
+    started = time.perf_counter()
+    result = {"status": 200, "result": res}
+    timings["response_generation"] = (time.perf_counter() - started) * 1000
+    _log_timing(timings)
+    return result
 
 
 @app.get("/api/admin/status")

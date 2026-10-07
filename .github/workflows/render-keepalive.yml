@@ -1,0 +1,22 @@
+name: Keep Render service warm
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Render health endpoint
+        env:
+          RENDER_HEALTH_URL: ${{ vars.RENDER_HEALTH_URL }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${RENDER_HEALTH_URL}" ]]; then
+            echo "Set the RENDER_HEALTH_URL Actions variable to your Render service base URL."
+            exit 1
+          fi
+          curl --fail --silent --show-error --max-time 30 \
+            "${RENDER_HEALTH_URL%/}/health"

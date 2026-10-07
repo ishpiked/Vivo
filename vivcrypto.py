@@ -23,6 +23,7 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import wasmtime
@@ -69,8 +70,8 @@ _VG_EXPIRY = {"at": 0.0}
 S = requests.Session()
 S.headers.update(HEADERS)
 try:
-    S.mount("https://", HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=2))
-    S.mount("http://", HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=2))
+    S.mount("https://", HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0))
+    S.mount("http://", HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0))
 except Exception:
     pass
 
@@ -116,6 +117,7 @@ if not _VG_EXPIRY["at"]:
 
 # ---------------- wasmtime -------------
 _store = wasmtime.Store()
+_WASM_LOCK = threading.RLock()
 _wasm_bytes = b""
 _wasm_url_used = ""
 
@@ -140,12 +142,13 @@ _exp, _BASE = _wasm_init(_wasm_bytes) if _wasm_bytes else (None, None)
 
 def wasm32_hex(msg: str) -> str:
     b = msg.encode()
-    ctypes.memmove(_BASE + _exp["in_ptr"](_store), b, len(b))
-    _exp["sign"](_store, len(b))
-    op = _exp["out_ptr"](_store)
-    out = (ctypes.c_ubyte * 32)()
-    ctypes.memmove(out, _BASE + op, 32)
-    return bytes(out).hex()
+    with _WASM_LOCK:
+        ctypes.memmove(_BASE + _exp["in_ptr"](_store), b, len(b))
+        _exp["sign"](_store, len(b))
+        op = _exp["out_ptr"](_store)
+        out = (ctypes.c_ubyte * 32)()
+        ctypes.memmove(out, _BASE + op, 32)
+        return bytes(out).hex()
 
 
 # ---------------- generic obfuscated-table decoder -------------
@@ -265,25 +268,33 @@ def bootstrap_crypto():
     if not wasm_cands or not enc_cands:
         raise ValueError("wasm/enc chunk not found")
     WASM_URL = VIV + wasm_cands[0]
-    wbytes = sess.get(WASM_URL, timeout=15).content
-    # /api/k needs a working VG
-    k = sess.get(f"{VIV}/api/k", cookies={"vg": VG},
-                 headers={"Referer": f"{VIV}/"}, timeout=15).text.strip()
+    # These resources do not depend on each other once the loader table is decoded.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        wasm_request = pool.submit(sess.get, WASM_URL, timeout=15)
+        key_request = pool.submit(
+            sess.get, f"{VIV}/api/k", cookies={"vg": VG},
+            headers={"Referer": f"{VIV}/"}, timeout=15)
+        encrypted_chunk_request = pool.submit(
+            sess.get, VIV + enc_cands[0],
+            headers={"Referer": f"{VIV}/"}, timeout=20)
+        wbytes = wasm_request.result().content
+        k = key_request.result().text.strip()
+        enc_b64 = encrypted_chunk_request.result().text.strip()
     if len(k) != 32 or any(c not in "0123456789abcdef" for c in k):
         raise ValueError("bad /api/k")
     exp_, base_ = _temp_wasm(wbytes)
 
     def ksign(msg: str) -> str:
         b = msg.encode()
-        ctypes.memmove(base_ + exp_["in_ptr"](_store), b, len(b))
-        exp_["sign"](_store, len(b))
-        op = exp_["out_ptr"](_store)
-        out = (ctypes.c_ubyte * 16)()
-        ctypes.memmove(out, base_ + op, 16)
-        return bytes(out).hex()
+        with _WASM_LOCK:
+            ctypes.memmove(base_ + exp_["in_ptr"](_store), b, len(b))
+            exp_["sign"](_store, len(b))
+            op = exp_["out_ptr"](_store)
+            out = (ctypes.c_ubyte * 16)()
+            ctypes.memmove(out, base_ + op, 16)
+            return bytes(out).hex()
 
     signed = ksign(k)
-    enc_b64 = sess.get(VIV + enc_cands[0], headers={"Referer": f"{VIV}/"}, timeout=20).text.strip()
     layer2 = _try_aes_gzip(enc_b64, signed)
     t2 = decode_table(layer2)
     chunk_paths = [s for s in t2 if s.startswith("/_next/static/") and s.endswith(".js")]
@@ -314,19 +325,21 @@ def bootstrap_crypto():
     if not _validate_crypto(wbytes, found_u, found_xcv):
         raise ValueError("validation failed")
     with _L:
-        U_HEX, X_CV = found_u, found_xcv
-        KEY_SOURCE["crypto"] = "live"
-        _exp, _BASE = _temp_wasm_keep(wbytes)
+        with _WASM_LOCK:
+            U_HEX, X_CV = found_u, found_xcv
+            KEY_SOURCE["crypto"] = "live"
+            _exp, _BASE = _temp_wasm_keep(wbytes)
         _save_state()
     return True
 
 
 def _temp_wasm(wbytes: bytes):
-    mod = wasmtime.Module(_store.engine, wbytes)
-    inst = wasmtime.Instance(_store, mod, [])
-    exp = inst.exports(_store)
-    base = ctypes.addressof(exp["memory"].data_ptr(_store).contents)
-    return exp, base
+    with _WASM_LOCK:
+        mod = wasmtime.Module(_store.engine, wbytes)
+        inst = wasmtime.Instance(_store, mod, [])
+        exp = inst.exports(_store)
+        base = ctypes.addressof(exp["memory"].data_ptr(_store).contents)
+        return exp, base
 
 
 def _temp_wasm_keep(wbytes: bytes):
@@ -343,12 +356,13 @@ def _validate_crypto(wbytes: bytes, u_hex: str, xcv: str) -> bool:
 
         def sig32(msg: str) -> str:
             b = msg.encode()
-            ctypes.memmove(base_ + exp_["in_ptr"](_store), b, len(b))
-            exp_["sign"](_store, len(b))
-            op = exp_["out_ptr"](_store)
-            out = (ctypes.c_ubyte * 32)()
-            ctypes.memmove(out, base_ + op, 32)
-            return bytes(out).hex()
+            with _WASM_LOCK:
+                ctypes.memmove(base_ + exp_["in_ptr"](_store), b, len(b))
+                exp_["sign"](_store, len(b))
+                op = exp_["out_ptr"](_store)
+                out = (ctypes.c_ubyte * 32)()
+                ctypes.memmove(out, base_ + op, 32)
+                return bytes(out).hex()
 
         s = requests.Session()
         s.headers.update({"User-Agent": UA, "Referer": f"{VIV}/", "Origin": VIV})
@@ -446,30 +460,38 @@ def _vg_maintainer():
 _NONCES = []
 _NONCES_DATE = {"date": None}
 _NONCES_LOCK = threading.Lock()
+_NONCE_FETCH_LOCK = threading.Lock()
 
 
-def _load_nonce_batch():
+def _load_nonce_batch(force=False):
     global _NONCES_DATE
-    r = S.get(f"{VIV}/api/n", timeout=10)
-    if r.status_code == 403:
-        if not ensure_vg():
-            raise RuntimeError("vg expired and browser refresh unavailable; "
-                               "set VIVARIUM_VG in .env (local) or Render dashboard, "
-                               "or POST /api/admin/vg with a fresh vg cookie")
+    with _NONCE_FETCH_LOCK:
+        with _NONCES_LOCK:
+            if _NONCES and not force:
+                return
         r = S.get(f"{VIV}/api/n", timeout=10)
-    r.raise_for_status()
-    payload = r.json()
-    if not isinstance(payload, list) or not payload:
-        raise RuntimeError("empty nonce payload from /api/n")
-    with _NONCES_LOCK:
-        _NONCES.extend(payload)
-        _NONCES_DATE["date"] = r.headers.get("Date")
+        if r.status_code == 403:
+            if not ensure_vg():
+                raise RuntimeError("vg expired and browser refresh unavailable; "
+                                   "set VIVARIUM_VG in .env (local) or Render dashboard, "
+                                   "or POST /api/admin/vg with a fresh vg cookie")
+            r = S.get(f"{VIV}/api/n", timeout=10)
+        r.raise_for_status()
+        payload = r.json()
+        if not isinstance(payload, list) or not payload:
+            raise RuntimeError("empty nonce payload from /api/n")
+        with _NONCES_LOCK:
+            _NONCES.extend(payload)
+            _NONCES_DATE["date"] = r.headers.get("Date")
 
 
 def _warm_nonce_pool(target=12):
     try:
-        while len(_NONCES) < target:
-            _load_nonce_batch()
+        while True:
+            with _NONCES_LOCK:
+                if len(_NONCES) >= target:
+                    break
+            _load_nonce_batch(force=True)
     except Exception:
         pass
 
