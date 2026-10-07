@@ -1,278 +1,253 @@
-# Vivarium API
+# Vivarium Stream API
 
-A self-hosted companion API for vivarium.su, shaped like enc-dec.app (which only covers cinejoy). It signs requests the same way the site's own frontend does, fetches stream links across all providers in the background, and presents them through two foreground servers: Aster for English dub anime, Vexa for Japanese audio with English subtitles.
+A small HTTP API for finding Vivarium stream sources for movies and TV
+episodes. The hosted instance is:
 
-## What it does
+```text
+https://kitsu-backend-2mbi.onrender.com
+```
 
-- Signs vivarium.su API calls (nonce + timestamp + WASM signature), so clients never touch the site's protection directly.
-- One-shot stream lookup by TMDB id, TMDB URL, or Vivarium watch URL.
-- Parallel provider race: return the first matching link without waiting for a full-list fetch.
-- Parsed quality tables on every result (label, height, provider, dub/hevc/hdr flags).
-- HLS links only. Video bytes always stream straight from vivarium's CDNs, never through this API, so hosting it costs almost no bandwidth.
+It signs requests to Vivarium, queries its stream providers, and returns usable
+HLS source URLs. Video and subtitle bytes are not proxied through this API;
+your player loads those directly from the source/CDN.
 
-## Endpoints
+## Quick start
 
-Successful API responses use the enc-dec.app envelope:
-`{"status": 200, "result": {...}}`. A source lookup with no usable HLS link
-returns HTTP 404 and `code: "no_sources"`.
+Use a TMDB URL or a Vivarium watch URL. Quote or URL-encode the input URL in
+your client so its `?` and `&` characters remain part of the `url` parameter.
+
+```text
+GET https://kitsu-backend-2mbi.onrender.com/api/vivarium?url=https%3A%2F%2Fwww.themoviedb.org%2Ftv%2F30984%2Fseason%2F2%2Fepisode%2F3&server=vexa
+```
+
+Equivalent using the Vivarium link from the Bleach example:
+
+```text
+GET https://kitsu-backend-2mbi.onrender.com/api/vivarium?url=https%3A%2F%2Fvivarium.su%2Fs%2Fbleach-30984%3Fw%3D1%26a%3D159322%26e%3D3&server=vexa
+```
+
+The second URL identifies Bleach's `a=159322` AniList course and course-local
+`e=3`. Vivarium's course data maps that to TMDB S2E16. Use `server=aster` for
+English dub streams; `server=vexa` requests Japanese audio with English
+subtitles. Omitting `server` searches without that server filter.
+
+Successful responses have this shape:
+
+```json
+{
+  "status": 200,
+  "result": {
+    "streams": [
+      {
+        "url": "https://stream.example/playlist.m3u8",
+        "type": "hls",
+        "quality": "1080p",
+        "provider": "Example"
+      }
+    ],
+    "subtitles": [],
+    "qualities": []
+  }
+}
+```
+
+The sample URL above is illustrative; actual stream URLs and metadata depend
+on Vivarium's current providers and availability.
+
+## Searching for a show
+
+This API does **not** currently have a title-search endpoint. Search for a
+show on TMDB, open the matching show/episode, then pass its URL to this API.
+Alternatively, use the included [`main.py`](./main.py) reference client: its
+`search` command searches TMDB, and its `stream` command sends a selected TMDB
+or Vivarium URL to this API.
+
+TMDB title search requires a TMDB API Read Access Token. Set it as
+`TMDB_API_READ_ACCESS_TOKEN` in your environment; the token is sent only to
+TMDB, not to the Vivarium API. You can also skip TMDB search entirely and use
+an existing TMDB/Vivarium URL or the API's ID parameters.
+
+PowerShell:
+
+```powershell
+$env:TMDB_API_READ_ACCESS_TOKEN = "your-tmdb-read-access-token"
+python main.py search "Bleach"
+```
+
+## Link parameters and episode mapping
+
+For a Vivarium watch URL such as
+`https://vivarium.su/s/bleach-30984?w=1&a=159322&e=3`:
+
+| Part | Meaning |
+| ---- | ------- |
+| `/s/` | Vivarium series route (`/m/` is its movie route); this is not a season number. |
+| `w=1` | Vivarium watch/player mode. It is not a season or episode number. |
+| `a=159322` | AniList ID for the selected anime course/title entry. |
+| `e=3` | Episode number within that AniList course when `a` is present. |
+| `s=...` | Optional explicit TMDB season number in the query string. |
+
+When the Vivarium URL contains `a` and `e` but no query-string `s`, this API
+fetches Vivarium's `/api/cours` data for the series ID in the path. It finds
+the matching AniList course and converts that course's episode ranges into
+TMDB season/episode coordinates. This handles cours that begin partway through
+a TMDB season. The `w` flag does not affect stream lookup.
+
+For a regular TMDB TV URL, include the season and episode in its path, for
+example:
+
+```text
+https://www.themoviedb.org/tv/30984/season/2/episode/3
+```
+
+A show-only TMDB URL needs `s` and `e` separately:
+
+```text
+GET /api/vivarium?url=https%3A%2F%2Fwww.themoviedb.org%2Ftv%2F30984&s=2&e=3
+```
+
+## API reference
+
+Responses use an envelope such as `{"status": 200, "result": {...}}`.
 
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
-| GET | `/health` | Lightweight local health check; no upstream request. |
-| GET | `/api/servers` | Foreground servers: Aster, Vexa |
-| GET | `/api/health-vivarium` | All background providers and their status |
-| GET | `/api/vivarium?url=&server=&race=` or `/api/vivarium?id=&type=&s=&e=&server=&race=` | One-shot lookup by TMDB/Vivarium URL or explicit media coordinates. `type` is `movie` or `tv`; `s`/`e` are TMDB season/episode for tv. `server` is `aster` or `vexa`. `race=true` (default) returns the first fitting link and does not fall back to a slower full-list fetch; `race=false` returns the full source list. |
-| GET | `/api/enc-vivarium?id=&type=&s=&e=` | **Password protected.** Signed request kit (`path`, `headers`, `cookies`, `url`); this includes the VG cookie. |
-| POST | `/api/dec-vivarium` | Filter a raw `/api/e` response: `{"response": {...}, "dub": false, "provider": null, "server": null}` |
-| GET | `/api/status` | Dashboard summary: uptime, request/lookup counters, caches, signing/bootstrap readiness. |
-| GET | `/api/status/metrics` | Request totals by route and HTTP status, latency summary, empty lookup count. |
-| GET | `/api/status/cache` | Cache sizes, entry cap, and TTLs. |
-| GET | `/api/status/crypto` | Signing readiness, nonce pool size, VG expiry, and bootstrap state (no credential values). |
-| GET | `/api/admin/status` | **Password protected.** Key sources, `vg` expiry, bootstrap state. |
-| POST | `/api/admin/vg` | **Password protected.** Hot-swap the `vg` cookie: `{"vg": "..."}`. No restart required. |
+| GET | `/health` | Local health check; no upstream lookup. |
+| GET | `/api/servers` | Lists foreground server filters (`aster`, `vexa`). |
+| GET | `/api/health-vivarium` | Checks Vivarium upstream/provider health. |
+| GET | `/api/vivarium?url=...` | Looks up a movie/episode from a TMDB or Vivarium URL. |
+| GET | `/api/vivarium?id=&type=&s=&e=` | Looks up using explicit Vivarium/TMDB media ID and coordinates. `type` is `movie` or `tv`; TV requires season `s` and episode `e`. |
+| GET | `/api/enc-vivarium?id=&type=&s=&e=` | **Protected.** Creates a signed request kit; includes the VG cookie. |
+| POST | `/api/dec-vivarium` | Filters a raw `/api/e` response. |
+| GET | `/api/status` | Process uptime, lookup counters, caches, and signing state. |
+| GET | `/api/status/metrics` | Request totals by route/status and latency statistics. |
+| GET | `/api/status/cache` | Cache sizes and TTLs. |
+| GET | `/api/status/crypto` | Signing readiness and bootstrap state (does not reveal credentials). |
+| GET | `/api/admin/status` | **Protected.** Detailed key sources and refresh state. |
+| POST | `/api/admin/vg` | **Protected.** Updates the Vivarium `vg` cookie. |
 
-### TMDB and Vivarium links
+### `/api/vivarium` options
 
-`/api/vivarium?url=` accepts TMDB movie/episode URLs and Vivarium `/m/...`
-or `/s/...` URLs. A TMDB season/episode URL supplies its own coordinates;
-for a series URL without them, pass `s` and `e` separately.
+Use either `url` or `id`/`type`:
 
-Vivarium watch URLs use `w=1` to open the player, `e` for the episode within
-the selected anime entry, and `a` for its AniList ID. The `s` in the path
-`/s/<slug>-<id>` means “series”; it is not a season number. When a Vivarium
-series URL has `a` but no explicit season, the API reads Vivarium's `/api/cours`
-mapping to translate the AniList course and its local episode number into the
-TMDB season and episode coordinates used for streaming. `w` is a player-mode
-flag, not a season index.
+| Parameter | Meaning |
+| --------- | ------- |
+| `url` | TMDB movie/episode or Vivarium `/m/...` / `/s/...` URL. |
+| `id` | Vivarium/TMDB media ID. |
+| `type` | `movie` or `tv`. |
+| `s`, `e` | Season and episode for TV. For an AniList Vivarium link, omit `s` to map its `a`/`e` course episode. |
+| `server` | `aster` (English dub) or `vexa` (Japanese audio, English subtitles). |
+| `dub` | Optional boolean English-dub filter. |
+| `provider` | Optional provider-name filter. |
+| `race` | Defaults to `true`: returns the first suitable source. Set `false` to fetch the full source list. |
 
-For example, Bleach's AniList ID `116674` maps episode 3 to TMDB S2E3, while
-AniList ID `159322` starts at TMDB S2E14, so its episode 3 resolves to S2E16.
-This mapping comes from Vivarium's current course data rather than a
-hard-coded title list:
+If both `url` and `id`/`type` are supplied, the API returns a 400 error. The
+URL host must be `themoviedb.org` or `vivarium.su` (including their `www`
+subdomains). TV links must resolve to both a season and episode before stream
+lookup.
 
-```
-GET /api/vivarium?url=https%3A%2F%2Fwww.themoviedb.org%2Ftv%2F30984%2Fseason%2F2%2Fepisode%2F3&server=vexa
-GET /api/vivarium?url=https%3A%2F%2Fvivarium.su%2Fs%2Fbleach-30984%3Fw%3D1%26a%3D159322%26e%3D3&server=vexa
-```
+### Existing ID-based requests
 
-The endpoint also continues to accept explicit `id`, `type`, `s`, and `e`
-parameters. Use either `url` or `id`/`type`; do not combine them.
+The URL interface is optional. Existing integrations can continue to call:
 
-The dashboard endpoints expose process-local counters and cache state; values
-reset when the service restarts. `/api/health-vivarium` separately checks the
-upstream provider health and can take as long as the upstream request.
-`/api/status` is local-only and does not make an upstream request. Its
-`state` is `ready` only when the signing material and WASM are present and the
-known VG expiry has not passed; it does not promise that Vivarium's providers
-are currently returning streams. General health and dashboard endpoints remain
-public; endpoints that expose the VG cookie or manage admin credentials require
-the admin password.
-
-Set `VIVARIUM_ADMIN_PASSWORD` in the service environment before using the
-protected endpoints. Send it only in the HTTP `Authorization` header using
-the `Bearer` scheme over HTTPS; never pass it as a query parameter or request
-body. Set the value in Render's environment settings to the password supplied
-for this deployment, or in the ignored local `.env` file for local development.
-
-Requests without the correct token receive HTTP `401`. If the environment
-variable is unset, protected endpoints fail closed with HTTP `503`. The
-password is not stored in source control; use Render's environment settings
-(the Blueprint declares it as `sync: false`) or the ignored local `.env` file.
-
-If no matching HLS stream with an HTTP(S) URL is available, `/api/vivarium` and
-`/api/dec-vivarium` return HTTP `404` with `code: "no_sources"` and a
-retry/provider health hint instead of caching or returning an empty successful
-result. Empty results are not cached, including stale empty entries, so a
-later request can discover newly available links.
-
-## Credentials and renewal
-
-The API signs Vivarium's protected `/api/e` and `/api/es` requests. There is no
-tested keyless path to stream results: an unsigned `/api/n` request returned
-HTTP 403, and unsigned `/api/e` returned no streams. Avoid third-party
-extractors or browser automation workarounds; they do not remove the upstream
-authorization requirement.
-
-- **`VIVARIUM_VG`** is the site cookie used to obtain nonces. It has an embedded
-  expiry (typically about 30 days). Check `GET /api/status/crypto` or
-  `GET /api/admin/status`; these report source and expiry, never the cookie
-  value.
-- **`VIVARIUM_U_HEX` and `VIVARIUM_XCV`** are signing parameters, not expiring
-  user tokens. Leave them empty: the service derives them from Vivarium's
-  current JavaScript in the background and validates the result. Check
-  `/api/status/crypto` for `crypto_source`, `bootstrap.ok`, and `bootstrap.last`.
-  If the site changes its signing implementation and bootstrap fails, update
-  the app and investigate the reported bootstrap error before pinning overrides.
-
-When VG expires or `/api/status/crypto` reports nonce/bootstrap failures:
-
-1. Open `https://vivarium.su` in your browser and complete any site challenge.
-2. In browser DevTools, open **Application/Storage → Cookies → vivarium.su**
-   and copy the current `vg` value. Never put the value in a URL, issue, or
-   committed file.
-3. **Recommended for Render:** update the `VIVARIUM_VG` environment variable
-   in the Render service settings and redeploy/restart the service.
-4. For a running service, `POST /api/admin/vg` also hot-swaps the value.
-   Send the admin password using the HTTP `Authorization` header with the
-   `Bearer` scheme over HTTPS. Prefer the Render dashboard setting for routine
-   cookie updates.
-5. Confirm `/api/status/crypto` shows a future VG expiry and a healthy nonce
-   pool. Retry the requested title. A 403 or `no_sources` can also indicate a
-   Vivarium/provider outage, not necessarily an expired cookie.
-
-For local development, update `VIVARIUM_VG` in the ignored `.env` file and
-restart the API. Leave the two crypto overrides blank unless diagnosing a
-confirmed site-side signing change. The optional browser refresh only works
-when SeleniumBase and a usable Chrome browser are installed; the standard
-Render Python service does not provide Chrome, so plan on manual VG renewal
-there.
-
-Examples (Jujutsu Kaisen S3E4, internal id 95479, absolute numbering):
-
-```
-GET /api/vivarium?id=95479&type=tv&s=1&e=51&server=vexa
-GET /api/vivarium?id=95479&type=tv&s=1&e=51&server=aster&race=true
+```text
+GET https://kitsu-backend-2mbi.onrender.com/api/vivarium?id=30984&type=tv&s=2&e=3&server=vexa
+GET https://kitsu-backend-2mbi.onrender.com/api/vivarium?id=635302&type=movie
 ```
 
-## Player integration
+For a complete list of sources rather than the first matching source:
 
-The API only hands out links. Your player fetches video bytes straight from
-the CDN, so send these headers on every stream and subtitle request:
-
+```text
+GET https://kitsu-backend-2mbi.onrender.com/api/vivarium?id=30984&type=tv&s=2&e=3&race=false
 ```
+
+### Errors
+
+| HTTP status | Meaning |
+| ----------- | ------- |
+| `400` | Invalid/missing input, unsupported URL, invalid coordinates, or unmapped AniList course. |
+| `401` | Missing/incorrect admin bearer password for a protected endpoint. |
+| `404` | No usable HLS stream was found (`code: "no_sources"`). |
+| `502` | Vivarium/course lookup failed or returned an invalid response. |
+| `503` | Protected endpoint is disabled because the admin password is not configured. |
+
+An empty stream result is not treated as success and is not cached. A
+`no_sources` response can mean that providers currently have no matching
+source; check `/api/health-vivarium` and try again later.
+
+## Using the streams in a player
+
+The API returns HLS playlist URLs and any subtitle tracks attached to those
+sources. It does not proxy media traffic. Your player must load the URLs
+directly. Vivarium's CDN may require these request headers:
+
+```text
 Referer: https://vivarium.su/
 User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36
 ```
 
-Without the Referer the CDN answers 403. Subtitle tracks arrive as separate
-`subs` URLs inside each stream object (`{url, lang, label}`); load the
-English one as an external track.
+Subtitle entries are supplied on each stream's `subs` field when available.
+Use the English track for the Vexa/subbed experience.
 
-mpv:
+## Reference Python client
 
-```
-mpv --referrer=https://vivarium.su/ "<stream url>" --sub-file="<en sub url>"
-```
-
-Browser with hls.js: `fetch` the `/api/vivarium` URL (CORS is open), pass
-`result.streams[i].url` to hls.js with `xhrSetup` adding the Referer, and add
-the English sub track to a `<track>` element. Heavy local playback
-(parallel segment mirror, seek cache) lives in `smooth.py` and is meant to
-run on your own machine, not on the deployed API.
-
-## Quickstart (local)
-
-Requirements: Python 3.10+ (Python 3.11.9 is used by the Render Blueprint).
-The pinned direct runtime dependencies are listed in `requirements.txt`; install
-them into a virtual environment:
+[`main.py`](./main.py) is a dependency-free example that can be copied into
+another Python project. It exposes reusable `search_titles`,
+`get_streams_by_url`, and `get_streams` functions, and a small CLI:
 
 ```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+# Search TMDB for a title (set TMDB_API_READ_ACCESS_TOKEN first)
+python main.py search "Bleach"
+
+# Pass a TMDB episode or Vivarium watch URL to the stream API
+python main.py stream "https://vivarium.su/s/bleach-30984?w=1&a=159322&e=3" --server vexa
+
+# Or use explicit coordinates
+python main.py stream --id 30984 --type tv --season 2 --episode 16 --server vexa
 ```
 
-1. Copy `.env.example` to `.env` and set `VIVARIUM_VG` from your browser
-   (Vivarium site → DevTools → Application/Storage → Cookies). Leave
-   `VIVARIUM_U_HEX` and `VIVARIUM_XCV` empty; they are derived automatically.
-2. Run: `uvicorn api:app --host 127.0.0.1 --port 8000`
-3. Check: `http://127.0.0.1:8000/api/status`
+The client defaults to this hosted service. Override it for your own
+deployment with `VIVARIUM_API_BASE_URL` or the global `--api-base-url` option
+before the subcommand.
 
-No keys live in the code. `.env` and `.vivcrypto.json` are git-ignored.
-`U_HEX` / `X_CV` are re-derived from the site's own JavaScript in the
-background and hot-swap in once validated. VG browser auto-refresh is optional
-and only works when SeleniumBase and a usable Chrome browser are installed;
-otherwise renew VG manually as described below.
+## Hosting and operations
 
-The Render service uses the same direct dependencies in
-`requirements.txt` and has `PYTHON_VERSION=3.11.9` in `render.yaml`. When
-updating dependency pins, update direct runtime packages there rather than
-pinning implementation-only transitive packages such as `pydantic-core` or
-`typing-extensions` independently.
+The live service is deployed on Render at
+`https://kitsu-backend-2mbi.onrender.com`. Public endpoints do not need an API
+key. Admin endpoints require `VIVARIUM_ADMIN_PASSWORD` and a bearer token in
+the `Authorization` header; never put the password in a URL or commit it.
 
-## Deploy (Render)
+The service signs Vivarium's protected `/api/e` and `/api/es` requests.
+`VIVARIUM_VG` is the Vivarium cookie used for nonce acquisition and expires
+periodically. The signing parameters are bootstrapped from Vivarium's current
+JavaScript. The protected status endpoints report readiness and expiry without
+returning credential values. For deployment/renewal, configure
+`VIVARIUM_VG` and `VIVARIUM_ADMIN_PASSWORD` in the hosting provider's secret
+environment settings.
 
-1. Push this folder to GitHub (take `api.py`, `vivcrypto.py`, `requirements.txt`, `render.yaml`, `.gitignore`, `LICENSE`; `smooth.py` / `vivarium.py` are local player scripts and optional).
-2. Render, New, Web Service, connect the repo (set Root Directory to this folder if it is not the repo root).
-3. Build: `pip install -r requirements.txt`. Start: `uvicorn api:app --host 0.0.0.0 --port $PORT`. Or deploy the included `render.yaml` as a Blueprint.
-4. Env vars: `PYTHON_VERSION=3.11.9`, `VIVARIUM_VG=<paste the cookie>`, and
-   `VIVARIUM_ADMIN_PASSWORD=<choose a strong password>`.
-   If creating the service manually instead of from `render.yaml`, set these
-   in **Settings → Environment**; the Blueprint file is not applied.
-5. Verify `/health`, `/api/status`, and `/api/status/crypto`.
+Responses are cached briefly in process memory (30 seconds). Counters and
+caches reset when the service restarts. The API has no search endpoint and
+does not relay stream bytes, so title search and playback happen in the
+calling application/player.
 
-`requirements.txt` pins the direct runtime dependencies: FastAPI/Pydantic for
-the API, Uvicorn for serving, Requests for the crypto bootstrap, HTTPX with
-HTTP/2 for pooled async lookups, Wasmtime for request signing, and
-Cryptography for bootstrap decryption. Transitive packages are intentionally
-not separately pinned.
+## Run your own instance
 
-Notes: Render disks are ephemeral, so `VIVARIUM_VG` in the dashboard is the
-source of truth. The native Python runtime has no Chrome, so browser
-auto-refresh stays dormant there. If the cookie expires, update `VIVARIUM_VG`
-in Render settings and redeploy/restart; avoid the unauthenticated
-`POST /api/admin/vg` on a public service without its bearer password. The
-signed request-kit endpoint `/api/enc-vivarium` is also protected because its
-response contains the VG cookie. Responses cache for 30s, which keeps upstream
-load (and latency on repeats) low without holding HLS links as long.
-Lookup requests reuse a pooled async HTTP client and negotiate HTTP/2 when the
-upstream supports it. Set the `vivarium.performance` logger to `INFO` to record
-per-stage `scrape_timing_ms` measurements (upstream request, parsing, source
-extraction, search-to-source, and response generation) plus end-to-end
-`scrape_response_ms`. `race=true` (the default) consumes the upstream event
-stream and returns the first matching HLS source; set `race=false` when the
-complete quality/source list is required. The upstream already supplies direct HLS URLs, so the API
-returns a fitting URL immediately without a HEAD/playlist probe that would add
-another network round trip.
+Requirements: Python 3.10+ (Render is configured for Python 3.11.9).
 
-### Best-effort keep-alive on Render Free
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn api:app --host 0.0.0.0 --port 8000
+```
 
-Render Free web services spin down after 15 minutes without inbound traffic.
-An external HTTP monitor can request `/health` every 5 minutes to reduce idle
-spin-downs; the endpoint performs no upstream work. Configure a free HTTP
-monitor in [UptimeRobot](https://uptimerobot.com/) with:
+Set the required service secrets as environment variables before deployment.
+See [`render.yaml`](./render.yaml) for the Render service configuration.
 
-1. Monitor type: **HTTP(s)**.
-2. URL: `https://kitsu-backend-2mbi.onrender.com/health`.
-3. Monitoring interval: **5 minutes** (available on UptimeRobot's Free plan).
-4. Expected status: HTTP `200`.
+## Project files
 
-The repository also includes a GitHub Actions scheduled probe every 5 minutes
-as a separate best-effort fallback:
-
-1. Push the workflow to the repository's default branch.
-2. Confirm **Actions** are enabled. The workflow targets
-   `https://kitsu-backend-2mbi.onrender.com/health`; you can run
-   **Keep Render service warm → Run workflow** to check it manually.
-
-Every `/health` request is logged with a UTC timestamp, path, HTTP status,
-latency, and the incoming `CF-Ray` identifier when present. `/robots.txt` is
-not used: Render may answer it itself while the service is asleep. The HTTP
-request to `/health` uses Render's normal wake-up behavior; cold starts can
-take about a minute, so the scheduled probe allows retries.
-
-This is best effort, not an uptime guarantee. Third-party monitors and GitHub
-scheduled workflows can be delayed or disabled, and Render can restart Free
-services at any time. Render documents no persistent-execution option for Free
-Web Services: they spin down after 15 minutes without inbound traffic, and a
-subsequent request wakes them. Free instances also share 750 instance hours
-per workspace per calendar month; if the workspace exhausts that amount,
-Render suspends its Free Web Services until the next month. A monitor cannot
-override those platform limits. Staying continuously available is only
-practical while the workspace remains within its included hours and Render
-permits the instance to run; guaranteed persistent execution requires a paid
-instance or another host with an always-on free tier.
-
-## Files
-
-- `api.py` - the FastAPI service described above.
-- `vivcrypto.py` - shared signing core: WASM signer, nonce pool, key bootstrap + refresh.
-- `requirements.txt`, `render.yaml` - Render deploy surface.
-- `.github/workflows/render-keepalive.yml` - scheduled health check for Render Free.
-- `player/` (local only, not pushed) - smooth player and lookup script. Heavy
-  playback runs on your own machine; the API only hands out links.
-
-## License
-
-MIT (c) spike. See `LICENSE`.
+- [`api.py`](./api.py) — FastAPI service and Vivarium link/episode mapping.
+- [`vivcrypto.py`](./vivcrypto.py) — request signing, nonce handling, and crypto bootstrap.
+- [`main.py`](./main.py) — portable reference client and CLI.
+- [`requirements.txt`](./requirements.txt) — server dependencies.
+- [`render.yaml`](./render.yaml) — Render Blueprint.
