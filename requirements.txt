@@ -1,12 +1,8 @@
-# Pinned working set. All entries ship cp314 manylinux wheels, so the build
-# works on Render's Python 3.14 image with no Rust toolchain involved.
+# Direct runtime dependencies. Render is configured to use Python 3.11.9.
+# Transitive dependencies are resolved from each package's declared constraints.
 fastapi==0.115.0
 uvicorn==0.34.0
 pydantic==2.13.5
-pydantic-core==2.46.5
-typing-inspection==0.4.4
-annotated-types==0.8.0
-typing-extensions==4.16.0
 wasmtime==49.0.0
 requests==2.32.3
 httpx[http2]==0.28.1

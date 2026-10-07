@@ -30,6 +30,7 @@ Requires: pip install fastapi uvicorn wasmtime requests
 Optional for VG auto-refresh: pip install seleniumbase (needs Chrome)
 """
 import asyncio
+import datetime
 import logging
 import re
 import threading
@@ -38,9 +39,9 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Query
-from fastapi import Request
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 
@@ -48,12 +49,31 @@ import vivcrypto as vc
 from vivcrypto import VIV, HEADERS
 
 _LOG = logging.getLogger("vivarium.performance")
+_HEALTH_LOG = logging.getLogger("vivarium.health")
+_HEALTH_LOG.setLevel(logging.INFO)
+_HEALTH_LOG.propagate = False
+if not _HEALTH_LOG.handlers:
+    _health_handler = logging.StreamHandler()
+    _health_handler.setFormatter(logging.Formatter("%(message)s"))
+    _HEALTH_LOG.addHandler(_health_handler)
 _CACHE = OrderedDict()  # (id,type,s,e,server,dub,provider,race) -> (at, result)
 _CACHE_TTL = 30
 _UPSTREAM_CACHE = OrderedDict()  # path -> (at, payload)
 _UPSTREAM_CACHE_TTL = 30
 _CACHE_LIMIT = 512
 _CACHE_LOCK = threading.Lock()
+_METRICS_LOCK = threading.Lock()
+_STARTED_AT = time.time()
+_METRICS = {
+    "requests_total": 0,
+    "status_codes": {},
+    "paths": {},
+    "total_latency_ms": 0.0,
+    "max_latency_ms": 0.0,
+    "last_request_at": None,
+    "lookups_total": 0,
+    "empty_lookups": 0,
+}
 
 
 def sign_request(path_qs: str):
@@ -84,6 +104,29 @@ def _cache_put(cache, key, value):
 def _log_timing(stages):
     _LOG.info("scrape_timing_ms %s", " ".join(
         f"{name}={value:.2f}" for name, value in stages.items()))
+
+
+def _record_lookup(empty: bool):
+    with _METRICS_LOCK:
+        _METRICS["lookups_total"] += 1
+        if empty:
+            _METRICS["empty_lookups"] += 1
+
+
+def _usable_hls_stream(stream: dict) -> bool:
+    url = stream.get("url")
+    if str(stream.get("type") or "").lower() != "hls" or not isinstance(url, str):
+        return False
+    return url.strip().lower().startswith(("http://", "https://"))
+
+
+def _no_sources_response():
+    return JSONResponse(status_code=404, content={
+        "status": 404, "result": "",
+        "error": "No usable HLS sources found",
+        "code": "no_sources",
+        "hint": "Try again later or check /api/health-vivarium for provider status.",
+    })
 
 
 class AdminVgBody(BaseModel):
@@ -172,7 +215,7 @@ def quality_list(streams) -> list:
 
 
 def wants_for(server_or_dub, s: dict) -> bool:
-    if s.get("type") != "hls":
+    if str(s.get("type") or "").lower() != "hls":
         return False
     if server_or_dub in ("aster", True):
         return is_dub(s)
@@ -200,7 +243,10 @@ async def _cached_upstream(client, path_qs: str, timings: dict):
     started = time.perf_counter()
     payload = response.json()
     timings["parse"] = (time.perf_counter() - started) * 1000
-    _cache_put(_UPSTREAM_CACHE, path_qs, payload)
+    streams = payload.get("streams", []) if isinstance(payload, dict) else []
+    if any(isinstance(stream, dict) and _usable_hls_stream(stream)
+           for stream in streams or []):
+        _cache_put(_UPSTREAM_CACHE, path_qs, payload)
     return payload
 
 
@@ -239,11 +285,14 @@ async def race_streams(client, path_qs: str, server_or_dub, provider, timings: d
                         time.perf_counter() - started) * 1000
 
                     started = time.perf_counter()
-                    for stream in data.get("streams", []) if isinstance(data, dict) else []:
+                    streams = data.get("streams") if isinstance(data, dict) else None
+                    for stream in streams or []:
                         if (isinstance(stream, dict)
                                 and wants_for(server_or_dub, stream)
+                                and _usable_hls_stream(stream)
                                 and (not provider or
-                                     (stream.get("provider") or "").lower() == provider.lower())):
+                                     (stream.get("provider") or "").lower()
+                                     == provider.lower())):
                             timings["extract"] = (time.perf_counter() - started) * 1000
                             timings["search"] = (
                                 time.perf_counter() - request_started) * 1000
@@ -274,8 +323,31 @@ app = FastAPI(lifespan=lifespan)
 async def profile_request(request: Request, call_next):
     started = time.perf_counter()
     response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    with _METRICS_LOCK:
+        _METRICS["requests_total"] += 1
+        status = str(response.status_code)
+        _METRICS["status_codes"][status] = (
+            _METRICS["status_codes"].get(status, 0) + 1)
+        route = request.scope.get("route")
+        path = route.path if route else "unmatched"
+        _METRICS["paths"][path] = _METRICS["paths"].get(path, 0) + 1
+        _METRICS["total_latency_ms"] += elapsed_ms
+        _METRICS["max_latency_ms"] = max(_METRICS["max_latency_ms"], elapsed_ms)
+        _METRICS["last_request_at"] = datetime.datetime.now(
+            datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    if request.url.path == "/health":
+        _HEALTH_LOG.info(
+            "health_probe timestamp=%s path=%s status=%d latency_ms=%.2f cf_ray=%s",
+            datetime.datetime.now(datetime.timezone.utc).isoformat(
+                timespec="milliseconds").replace("+00:00", "Z"),
+            request.url.path,
+            response.status_code,
+            elapsed_ms,
+            request.headers.get("cf-ray", "-"),
+        )
     if request.url.path == "/api/vivarium":
-        _LOG.info("scrape_response_ms %.2f", (time.perf_counter() - started) * 1000)
+        _LOG.info("scrape_response_ms %.2f", elapsed_ms)
     return response
 app.add_middleware(
     CORSMiddleware,
@@ -297,7 +369,7 @@ def root():
     return {"status": "ok", "service": "vivarium-api"}
 
 @app.get("/health")
-def health():
+async def health():
     return {"status": "healthy"}
 
 @app.get("/api/servers")
@@ -348,7 +420,13 @@ def dec_vivarium(body: DecBody):
     if body.server and body.server.lower() not in ("aster", "vexa"):
         return {"status": 400, "result": "", "error": "Invalid server",
                 "hint": "server must be aster|vexa"}
-    return {"status": 200, "result": filter_streams(body.response, body.dub, body.provider, body.server)}
+    result = filter_streams(body.response, body.dub, body.provider, body.server)
+    result["streams"] = [stream for stream in result["streams"]
+                         if _usable_hls_stream(stream)]
+    result["qualities"] = quality_list(result["streams"])
+    if not result["streams"]:
+        return _no_sources_response()
+    return {"status": 200, "result": result}
 
 
 @app.get("/api/vivarium")
@@ -379,10 +457,16 @@ async def vivarium(
     res = _cache_get(_CACHE, key, _CACHE_TTL)
     cache_lookup_ms = (time.perf_counter() - cache_started) * 1000
     if res is not None:
+        if not res.get("streams"):
+            with _CACHE_LOCK:
+                _CACHE.pop(key, None)
+            _record_lookup(True)
+            return _no_sources_response()
         started = time.perf_counter()
         res = dict(res)
         res["cached"] = True
         result = {"status": 200, "result": res}
+        _record_lookup(not bool(res.get("streams")))
         _log_timing({"cache_lookup": cache_lookup_ms,
                      "response_generation": (time.perf_counter() - started) * 1000})
         return result
@@ -398,8 +482,15 @@ async def vivarium(
         if won:
             started = time.perf_counter()
             res = filter_streams({"streams": [won], "subtitles": []}, dub, provider, server)
+            res["streams"] = [stream for stream in res["streams"]
+                              if _usable_hls_stream(stream)]
+            res["qualities"] = quality_list(res["streams"])
+            if not res["streams"]:
+                _record_lookup(True)
+                return _no_sources_response()
             timings["source_extraction"] = (time.perf_counter() - started) * 1000
             _cache_put(_CACHE, key, res)
+            _record_lookup(False)
             started = time.perf_counter()
             result = {"status": 200, "result": res}
             timings["response_generation"] = (time.perf_counter() - started) * 1000
@@ -411,8 +502,15 @@ async def vivarium(
         return {"status": 502, "result": "", "error": str(ex)}
     started = time.perf_counter()
     res = filter_streams(payload, dub, provider, server)
+    res["streams"] = [stream for stream in res["streams"]
+                      if _usable_hls_stream(stream)]
+    res["qualities"] = quality_list(res["streams"])
+    if not res["streams"]:
+        _record_lookup(True)
+        return _no_sources_response()
     timings["source_extraction"] = (time.perf_counter() - started) * 1000
     _cache_put(_CACHE, key, res)
+    _record_lookup(False)
     started = time.perf_counter()
     result = {"status": 200, "result": res}
     timings["response_generation"] = (time.perf_counter() - started) * 1000
@@ -420,9 +518,107 @@ async def vivarium(
     return result
 
 
+@app.get("/api/status")
+def api_status():
+    with _METRICS_LOCK:
+        request_count = _METRICS["requests_total"]
+        avg_latency = (_METRICS["total_latency_ms"] / request_count
+                       if request_count else 0.0)
+        runtime = {
+            "started_at": datetime.datetime.fromtimestamp(
+                _STARTED_AT, datetime.timezone.utc).isoformat(
+                    timespec="seconds").replace("+00:00", "Z"),
+            "uptime_seconds": round(time.time() - _STARTED_AT, 2),
+            "last_request_at": _METRICS["last_request_at"],
+            "requests_total": request_count,
+            "average_latency_ms": round(avg_latency, 2),
+            "max_latency_ms": round(_METRICS["max_latency_ms"], 2),
+            "lookups_total": _METRICS["lookups_total"],
+            "empty_lookups": _METRICS["empty_lookups"],
+        }
+    with _CACHE_LOCK:
+        cache = {"response_entries": len(_CACHE),
+                 "upstream_entries": len(_UPSTREAM_CACHE)}
+    with vc._NONCES_LOCK:
+        nonce_count = len(vc._NONCES)
+    signing_ready = bool(vc.U_HEX and vc.X_CV and vc._exp is not None)
+    vg_expiry = vc._VG_EXPIRY["at"]
+    if vg_expiry and vg_expiry <= time.time():
+        signing_ready = False
+    return {"status": 200, "result": {
+        "service": "vivarium-api",
+        "state": "ready" if signing_ready else "degraded",
+        "runtime": runtime,
+        "cache": cache,
+        "crypto": {
+            "vg_source": vc.KEY_SOURCE["vg"],
+            "vg_expiry_utc": datetime.datetime.fromtimestamp(
+                vg_expiry, datetime.timezone.utc).isoformat(timespec="seconds")
+                if vg_expiry else None,
+            "crypto_source": vc.KEY_SOURCE["crypto"],
+            "wasm_ready": vc._exp is not None,
+            "signing_ready": signing_ready,
+            "nonce_pool_size": nonce_count,
+            "bootstrap_running": vc._BOOT["running"],
+            "bootstrap_ok": vc._BOOT["ok"],
+        },
+    }}
+
+
+@app.get("/api/status/metrics")
+def api_status_metrics():
+    with _METRICS_LOCK:
+        request_count = _METRICS["requests_total"]
+        return {"status": 200, "result": {
+            "requests_total": request_count,
+            "status_codes": dict(_METRICS["status_codes"]),
+            "paths": dict(_METRICS["paths"]),
+            "average_latency_ms": round(
+                _METRICS["total_latency_ms"] / request_count, 2)
+                if request_count else 0.0,
+            "max_latency_ms": round(_METRICS["max_latency_ms"], 2),
+            "last_request_at": _METRICS["last_request_at"],
+            "lookups_total": _METRICS["lookups_total"],
+            "empty_lookups": _METRICS["empty_lookups"],
+        }}
+
+
+@app.get("/api/status/cache")
+def api_status_cache():
+    with _CACHE_LOCK:
+        return {"status": 200, "result": {
+            "response_entries": len(_CACHE),
+            "upstream_entries": len(_UPSTREAM_CACHE),
+            "entry_limit": _CACHE_LIMIT,
+            "response_ttl_seconds": _CACHE_TTL,
+            "upstream_ttl_seconds": _UPSTREAM_CACHE_TTL,
+        }}
+
+
+@app.get("/api/status/crypto")
+def api_status_crypto():
+    expiry = vc._VG_EXPIRY["at"]
+    with vc._NONCES_LOCK:
+        nonce_count = len(vc._NONCES)
+    return {"status": 200, "result": {
+        "vg_source": vc.KEY_SOURCE["vg"],
+        "vg_expiry_utc": datetime.datetime.fromtimestamp(
+            expiry, datetime.timezone.utc).isoformat(timespec="seconds")
+            if expiry else None,
+        "crypto_source": vc.KEY_SOURCE["crypto"],
+        "wasm_ready": vc._exp is not None,
+        "wasm_url": vc.WASM_URL,
+        "nonce_pool_size": nonce_count,
+        "bootstrap": {
+            "running": vc._BOOT["running"],
+            "ok": vc._BOOT["ok"],
+            "last": vc._BOOT["last"],
+        },
+    }}
+
+
 @app.get("/api/admin/status")
 def admin_status():
-    import datetime
     exp = vc._VG_EXPIRY["at"]
     return {"status": 200, "result": {
         "vg_source": vc.KEY_SOURCE["vg"],

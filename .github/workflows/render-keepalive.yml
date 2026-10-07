@@ -2,7 +2,7 @@ name: Keep Render service warm
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -11,12 +11,29 @@ jobs:
     steps:
       - name: Check Render health endpoint
         env:
-          RENDER_HEALTH_URL: ${{ vars.RENDER_HEALTH_URL }}
+          RENDER_HEALTH_URL: https://kitsu-backend-2mbi.onrender.com
         run: |
           set -euo pipefail
           if [[ -z "${RENDER_HEALTH_URL}" ]]; then
-            echo "Set the RENDER_HEALTH_URL Actions variable to your Render service base URL."
+            echo "Configure this workflow with the Render service base URL."
             exit 1
           fi
-          curl --fail --silent --show-error --max-time 30 \
-            "${RENDER_HEALTH_URL%/}/health"
+          url="${RENDER_HEALTH_URL%/}/health"
+          for attempt in 1 2 3; do
+            echo "probe_attempt=${attempt} timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            response="$(curl --silent --show-error --max-time 120 \
+              --write-out $'\n%{http_code}' "${url}")" || response=""
+            status="${response##*$'\n'}"
+            body="${response%$'\n'*}"
+            echo "http_status=${status:-request_failed}"
+            if [[ "${status}" == "200" ]] \
+              && grep -Eq '"status"[[:space:]]*:[[:space:]]*"healthy"' <<< "${body}"; then
+              echo "health_payload=healthy"
+              exit 0
+            fi
+            if [[ "${attempt}" -lt 3 ]]; then
+              sleep 10
+            fi
+          done
+          echo "Render health endpoint did not return the expected healthy response."
+          exit 1
