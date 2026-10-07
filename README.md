@@ -31,6 +31,32 @@ GET /api/vivarium?id=95479&type=tv&s=1&e=51&server=vexa
 GET /api/vivarium?id=95479&type=tv&s=1&e=51&server=aster&race=true
 ```
 
+## Player integration
+
+The API only hands out links. Your player fetches video bytes straight from
+the CDN, so send these headers on every stream and subtitle request:
+
+```
+Referer: https://vivarium.su/
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36
+```
+
+Without the Referer the CDN answers 403. Subtitle tracks arrive as separate
+`subs` URLs inside each stream object (`{url, lang, label}`); load the
+English one as an external track.
+
+mpv:
+
+```
+mpv --referrer=https://vivarium.su/ "<stream url>" --sub-file="<en sub url>"
+```
+
+Browser with hls.js: `fetch` the `/api/vivarium` URL (CORS is open), pass
+`result.streams[i].url` to hls.js with `xhrSetup` adding the Referer, and add
+the English sub track to a `<track>` element. Heavy local playback
+(parallel segment mirror, seek cache) lives in `smooth.py` and is meant to
+run on your own machine, not on the deployed API.
+
 ## Quickstart (local)
 
 Requirements: Python 3.10+, `pip install -r requirements.txt`.
@@ -46,17 +72,18 @@ No keys live in the code. `.env` and `.vivcrypto.json` are git-ignored. `U_HEX` 
 1. Push this folder to GitHub (take `api.py`, `vivcrypto.py`, `requirements.txt`, `render.yaml`, `.gitignore`, `LICENSE`; `smooth.py` / `vivarium.py` are local player scripts and optional).
 2. Render, New, Web Service, connect the repo (set Root Directory to this folder if it is not the repo root).
 3. Build: `pip install -r requirements.txt`. Start: `uvicorn api:app --host 0.0.0.0 --port $PORT`. Or deploy the included `render.yaml` as a Blueprint.
-4. Env vars: `PYTHON_VERSION=3.11.9`, `VIVARIUM_VG=<paste the cookie>`.
+4. Env vars: `PYTHON_VERSION=3.11.9`, `VIVARIUM_VG=<paste the cookie>`. Note: if you created the service by hand in the dashboard instead of from `render.yaml`, the file is ignored, so set both vars in Settings, Environment by hand. Pins in `requirements.txt` all ship Python 3.14 wheels too, so a 3.14 image also builds.
 5. Verify `/api/servers` and `/api/admin/status`.
 
 Notes: Render disks are ephemeral, so `VIVARIUM_VG` in the dashboard is the source of truth. The native Python runtime has no Chrome, so browser auto-refresh stays dormant there; if the cookie dies, `POST /api/admin/vg` with a fresh one, no redeploy. Responses cache for 120s, which keeps upstream load (and latency on repeats) low.
 
 ## Files
 
-- `api.py` - the FastAPI service described above.
+- `api.py` - the FastAPI service described above. This is the only file the
+  Render deployment needs (plus `vivcrypto.py`).
 - `vivcrypto.py` - shared signing core: WASM signer, nonce pool, key bootstrap + refresh, used by everything else.
-- `smooth.py` - local smooth player: parallel HLS mirror + mpv, `--server aster|vexa`, `--quality best|720p|...`.
-- `vivarium.py` - minimal lookup script in the same style as the cinejoy sample.
+- `smooth.py` - local smooth player: parallel HLS mirror + mpv, `--server aster|vexa`, `--quality best|720p|...`. Runs on your own machine. Heavy on bandwidth by design.
+- `vivarium.py` - minimal local lookup script in the same style as the cinejoy sample.
 
 ## License
 
