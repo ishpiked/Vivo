@@ -28,7 +28,7 @@ import requests
 import wasmtime
 from requests.adapters import HTTPAdapter
 
-VIV = "https://vivarium.su"
+VIV = os.environ.get("VIVARIUM_BASE_URL", "https://vivarium.su")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
 HEADERS = {"User-Agent": UA, "Referer": f"{VIV}/", "Origin": VIV}
 
@@ -52,7 +52,7 @@ _load_dotenv()
 _FB_VG = os.environ.get("VIVARIUM_VG", "")
 _FB_U = os.environ.get("VIVARIUM_U_HEX", "")
 _FB_XCV = os.environ.get("VIVARIUM_XCV", "")
-_FB_WASM_URL = f"{VIV}/_next/static/media/hkf9.bin"
+_FB_WASM_URL = os.environ.get("VIVARIUM_WASM_URL", f"{VIV}/_next/static/media/hkf9.bin")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _STATE = os.path.join(_HERE, ".vivcrypto.json")
@@ -62,7 +62,7 @@ _L = threading.Lock()
 VG = os.environ.get("VIVARIUM_VG", "")
 U_HEX = ""
 X_CV = ""
-WASM_URL = _FB_WASM_URL
+WASM_URL = os.environ.get("VIVARIUM_WASM_URL", _FB_WASM_URL)
 KEY_SOURCE = {"vg": "fallback", "crypto": "fallback"}
 _VG_EXPIRY = {"at": 0.0}
 
