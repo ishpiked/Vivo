@@ -33,6 +33,7 @@ Optional for VG auto-refresh: pip install seleniumbase (needs Chrome)
 import re
 import time
 from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 
@@ -98,6 +99,10 @@ def filter_streams(data: dict, dub: bool = False, provider: Optional[str] = None
         streams = [x for x in streams if is_dub(x)]
     if provider:
         streams = [x for x in streams if (x.get("provider") or "").lower() == provider.lower()]
+    if server and server.lower() == "vexa":
+        # Subtitled streams first: a vexa pick without subs is a broken pick.
+        streams = sorted(streams, key=lambda x: (bool(x.get("subs")), x.get("rank", 0)),
+                         reverse=True)
     return {"streams": streams, "subtitles": data.get("subtitles", []),
             "qualities": quality_list(streams)}
 
@@ -171,6 +176,12 @@ def race_streams(path_qs: str, server_or_dub, timeout: int = 25):
 
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 
 class DecBody(BaseModel):
