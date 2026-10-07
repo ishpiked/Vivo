@@ -50,7 +50,7 @@ def _load_dotenv():
 
 
 _load_dotenv()
-_FB_VG = os.environ.get("VIVARIUM_VG", "1793937779.63109fb941f546093707e993905b5c39cff8b200bd67bd8369c1575d601e84fe")
+_FB_VG = os.environ.get("VIVARIUM_VG", "1793998860.79421e4463e736cb6a7b9b64841579384ea71d22c8872dbb88fda0ac44184c5e")
 _FB_U = os.environ.get("VIVARIUM_U_HEX", "6edcbfdc5dc8f3172c200f834e12eaa88b1d56fcd19f6f7743de2edad7d6b4b0")
 _FB_XCV = os.environ.get("VIVARIUM_XCV", "8b3debbfbe79")
 _FB_WASM_URL = os.environ.get("VIVARIUM_WASM_URL", f"{VIV}/_next/static/media/hkf9.bin")
