@@ -6,7 +6,7 @@ services:
     buildCommand: pip install -r requirements.txt
     # Render injects $PORT; bind all interfaces.
     startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /api/servers
+    healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9

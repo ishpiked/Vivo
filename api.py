@@ -191,6 +191,14 @@ class DecBody(BaseModel):
     server: Optional[str] = None
 
 
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "vivarium-api"}
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
 @app.get("/api/servers")
 def servers():
     return {"status": 200, "result": {"servers": SERVERS}}
