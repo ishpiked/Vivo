@@ -20,7 +20,7 @@ Endpoints:
           Client then GETs https://vivarium.su<path> themselves.
   POST /api/dec-vivarium  {"response": <raw /api/e JSON>, "dub": bool, "provider": str|None, "server": "aster"|"vexa"|None}
        -> {"streams":[...],"subtitles":[...],"qualities":[...]} filtered (like dec-cinejoy).
-  GET  /api/vivarium?id=&type=&s=&e=&dub=&provider=&server=&race=
+  GET  /api/vivarium?url=... or ?id=&type=&s=&e=&dub=&provider=&server=&race=
        -> one-shot convenience: race=true (default) returns the first matching
           HLS source from the parallel provider event stream. race=false fetches
           the complete list when all qualities/sources are required.
@@ -41,6 +41,7 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -53,21 +54,8 @@ import vivcrypto as vc
 from vivcrypto import VIV, HEADERS
 
 # ============================================================================
-# Anime ID Mapping: Vivarium Internal IDs -> TMDB Anime IDs
-# ============================================================================
-# Research found that these Vivarium internal IDs map directly to identical TMDB IDs:
-# 30984 -> Bleach (TV Series 2004)
-# 635302 -> Demon Slayer Movie
-# 37854 -> One Piece (TV Series 1999)
-# 61663 -> Your Lie in April (TV Series 2014)
-# 46260 -> Naruto (TV Series 2002)
-#
-# Key findings:
-# - All 5 test IDs map 1:1 to TMDB IDs
-# - Season/episode numbering follows TMDB conventions varying by series
-# - Season 0 in TMDB = specials/OVAs
-# - Different series have different season structures (One Piece: 23 seasons, 
-#   Bleach: 2 seasons split, Naruto: 4 seasons vs TVDB's 5)
+# Legacy curated anime metadata. Live link resolution uses Vivarium's
+# /api/cours mapping instead of assuming this table covers every title.
 # ============================================================================
 
 VIVARIUM_ID_MAP = {
@@ -298,11 +286,147 @@ class AdminVgBody(BaseModel):
 
 
 def build_qs(id: str, type: str, s: Optional[str], e: Optional[str]) -> str:
+    if type not in ("movie", "tv"):
+        raise ValueError("type must be movie|tv")
     if type == "movie":
-        return f"/api/e?id={id}&type=movie"
+        return f"/api/e?{urlencode({'id': id, 'type': 'movie'})}"
     if not s or not e:
         raise ValueError("tv requires s and e")
-    return f"/api/e?id={id}&type={type}&s={s}&e={e}"
+    return f"/api/e?{urlencode({'id': id, 'type': type, 's': s, 'e': e})}"
+
+
+def _link_query_value(query: dict, key: str) -> Optional[str]:
+    values = query.get(key)
+    return values[-1] if values else None
+
+
+def parse_media_url(media_url: str) -> dict:
+    """Parse a TMDB episode/movie URL or a Vivarium show URL."""
+    try:
+        parsed = urlsplit(media_url)
+    except ValueError as ex:
+        raise ValueError("Invalid media URL") from ex
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("URL must be an absolute HTTP(S) media link")
+    if parsed.username or parsed.password:
+        raise ValueError("Credentials are not allowed in media URLs")
+
+    host = parsed.hostname.lower()
+    segments = [part for part in parsed.path.split("/") if part]
+    query = parse_qs(parsed.query)
+    if host in ("themoviedb.org", "www.themoviedb.org", "m.themoviedb.org"):
+        route_index = next(
+            (index for index, part in enumerate(segments)
+             if part in ("movie", "tv")),
+            None)
+        if route_index is None or route_index + 1 >= len(segments):
+            raise ValueError("TMDB URL must contain /movie/<id> or /tv/<id>")
+        content_type = segments[route_index]
+        id_match = re.match(r"^(\d+)(?:-|$)", segments[route_index + 1])
+        if not id_match:
+            raise ValueError("TMDB URL does not contain a numeric media id")
+        season = _link_query_value(query, "s")
+        episode = _link_query_value(query, "e")
+        if content_type == "tv":
+            for index, part in enumerate(segments[route_index + 2:],
+                                         start=route_index + 2):
+                if part == "season" and index + 1 < len(segments):
+                    season = segments[index + 1]
+                elif part == "episode" and index + 1 < len(segments):
+                    episode = segments[index + 1]
+        return {
+            "id": id_match.group(1), "type": content_type,
+            "s": season, "e": episode,
+            "a": _link_query_value(query, "a"),
+        }
+
+    if host not in ("vivarium.su", "www.vivarium.su"):
+        raise ValueError("URL host must be themoviedb.org or vivarium.su")
+    if len(segments) < 2 or segments[0] not in ("s", "m"):
+        raise ValueError("Vivarium URL must use /s/<slug-id> or /m/<slug-id>")
+    id_match = re.search(r"-(\d+)$", segments[1])
+    if not id_match:
+        raise ValueError("Vivarium URL does not contain a numeric media id")
+    return {
+        "id": id_match.group(1),
+        "type": "tv" if segments[0] == "s" else "movie",
+        "s": _link_query_value(query, "s"),
+        "e": _link_query_value(query, "e"),
+        "a": _link_query_value(query, "a"),
+    }
+
+
+async def resolve_media_url(media_url: str, season: Optional[str],
+                            episode: Optional[str], client) -> dict:
+    """Resolve URL parameters to the TMDB coordinates Vivarium's API expects."""
+    media = parse_media_url(media_url)
+    media["s"] = season or media["s"]
+    media["e"] = episode or media["e"]
+    if media["type"] == "movie":
+        return media
+
+    if (media["s"] is not None
+            and (not re.fullmatch(r"\d+", media["s"])
+                 or int(media["s"]) < 0)):
+        raise ValueError("Season number (s) must be a non-negative integer")
+    if (media["e"] is not None
+            and (not re.fullmatch(r"\d+", media["e"])
+                 or int(media["e"]) < 1)):
+        raise ValueError("Episode number (e) must be a positive integer")
+
+    ani_id = media["a"]
+    if ani_id and not media["s"]:
+        if not re.fullmatch(r"\d+", ani_id):
+            raise ValueError("AniList id (a) must be numeric")
+        if not media["e"]:
+            raise ValueError("TV links require an episode number (e)")
+
+        try:
+            response = await client.get(
+                f"{VIV}/api/cours", params={"id": media["id"]},
+                timeout=httpx.Timeout(connect=5, read=15, write=5, pool=5))
+        except httpx.HTTPError as ex:
+            raise RuntimeError(f"Vivarium course lookup failed: {ex}") from ex
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Vivarium course lookup failed: {response.status_code}")
+        try:
+            payload = response.json()
+        except ValueError as ex:
+            raise RuntimeError("Vivarium returned invalid course data") from ex
+        courses = payload.get("cours") if isinstance(payload, dict) else None
+        if not isinstance(courses, list):
+            raise RuntimeError("Vivarium returned invalid course data")
+        course = next(
+            (item for item in courses
+             if isinstance(item, dict) and str(item.get("al")) == ani_id),
+            None)
+        if course is None:
+            raise ValueError(
+                f"AniList id {ani_id} is not mapped to this Vivarium title")
+
+        remaining = int(media["e"])
+        ranges = course.get("r")
+        if not isinstance(ranges, list):
+            raise RuntimeError("Vivarium returned invalid episode mapping data")
+        for episode_range in ranges:
+            if (not isinstance(episode_range, list) or len(episode_range) != 3
+                    or not all(str(value).isdigit()
+                               for value in episode_range)):
+                raise RuntimeError("Vivarium returned invalid episode mapping data")
+            tmdb_season, first_episode, last_episode = map(int, episode_range)
+            episode_count = last_episode - first_episode + 1
+            if tmdb_season < 0 or first_episode < 1 or episode_count < 1:
+                raise RuntimeError("Vivarium returned invalid episode mapping data")
+            if remaining <= episode_count:
+                media["s"] = str(tmdb_season)
+                media["e"] = str(first_episode + remaining - 1)
+                return media
+            remaining -= episode_count
+        raise ValueError(
+            f"Episode {media['e']} is outside AniList id {ani_id}'s episode range")
+
+    return media
 
 
 # FOREGROUND servers. Only these two are shown; every real provider
@@ -614,6 +738,7 @@ async def vivarium(
     request: Request,
     id: Optional[str] = Query(None),
     type: Optional[str] = Query(None),
+    url: Optional[str] = Query(None),
     s: Optional[str] = Query(None),
     e: Optional[str] = Query(None),
     dub: bool = Query(False),
@@ -621,12 +746,25 @@ async def vivarium(
     server: Optional[str] = Query(None),
     race: bool = Query(True),
 ):
-    if not id or not type:
-        return {"status": 400, "result": "", "error": "Expected query: id, type",
-                "hint": "GET: /api/vivarium?id=[tmdb_or_internal]&type=[movie|tv]&s=[season]&e=[episode]&server=[aster|vexa]"}
     if server and server.lower() not in ("aster", "vexa"):
         return {"status": 400, "result": "", "error": "Invalid server",
                 "hint": "server must be aster|vexa"}
+    if url and (id or type):
+        return {"status": 400, "result": "",
+                "error": "Use either url or id and type, not both"}
+    if url:
+        try:
+            media = await resolve_media_url(
+                url, s, e, request.app.state.http)
+        except ValueError as ex:
+            return {"status": 400, "result": "", "error": str(ex)}
+        except RuntimeError as ex:
+            return {"status": 502, "result": "", "error": str(ex)}
+        id, type, s, e = (
+            media["id"], media["type"], media["s"], media["e"])
+    elif not id or not type:
+        return {"status": 400, "result": "", "error": "Expected query: id, type",
+                "hint": "GET: /api/vivarium?url=[TMDB_or_Vivarium_link] or /api/vivarium?id=[tmdb_or_internal]&type=[movie|tv]&s=[season]&e=[episode]&server=[aster|vexa]"}
     try:
         path = build_qs(id, type, s, e)
     except ValueError as ex:

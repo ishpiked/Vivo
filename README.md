@@ -5,7 +5,7 @@ A self-hosted companion API for vivarium.su, shaped like enc-dec.app (which only
 ## What it does
 
 - Signs vivarium.su API calls (nonce + timestamp + WASM signature), so clients never touch the site's protection directly.
-- One-shot stream lookup by TMDB id (movies/series) or internal id (anime).
+- One-shot stream lookup by TMDB id, TMDB URL, or Vivarium watch URL.
 - Parallel provider race: return the first matching link without waiting for a full-list fetch.
 - Parsed quality tables on every result (label, height, provider, dub/hevc/hdr flags).
 - HLS links only. Video bytes always stream straight from vivarium's CDNs, never through this API, so hosting it costs almost no bandwidth.
@@ -21,7 +21,7 @@ returns HTTP 404 and `code: "no_sources"`.
 | GET | `/health` | Lightweight local health check; no upstream request. |
 | GET | `/api/servers` | Foreground servers: Aster, Vexa |
 | GET | `/api/health-vivarium` | All background providers and their status |
-| GET | `/api/vivarium?id=&type=&s=&e=&server=&race=` | One-shot lookup. `type` is `movie` or `tv`; `s`/`e` are season/episode for tv. `server` is `aster` or `vexa`. `race=true` (default) returns the first fitting link and does not fall back to a slower full-list fetch; `race=false` returns the full source list. |
+| GET | `/api/vivarium?url=&server=&race=` or `/api/vivarium?id=&type=&s=&e=&server=&race=` | One-shot lookup by TMDB/Vivarium URL or explicit media coordinates. `type` is `movie` or `tv`; `s`/`e` are TMDB season/episode for tv. `server` is `aster` or `vexa`. `race=true` (default) returns the first fitting link and does not fall back to a slower full-list fetch; `race=false` returns the full source list. |
 | GET | `/api/enc-vivarium?id=&type=&s=&e=` | **Password protected.** Signed request kit (`path`, `headers`, `cookies`, `url`); this includes the VG cookie. |
 | POST | `/api/dec-vivarium` | Filter a raw `/api/e` response: `{"response": {...}, "dub": false, "provider": null, "server": null}` |
 | GET | `/api/status` | Dashboard summary: uptime, request/lookup counters, caches, signing/bootstrap readiness. |
@@ -30,6 +30,33 @@ returns HTTP 404 and `code: "no_sources"`.
 | GET | `/api/status/crypto` | Signing readiness, nonce pool size, VG expiry, and bootstrap state (no credential values). |
 | GET | `/api/admin/status` | **Password protected.** Key sources, `vg` expiry, bootstrap state. |
 | POST | `/api/admin/vg` | **Password protected.** Hot-swap the `vg` cookie: `{"vg": "..."}`. No restart required. |
+
+### TMDB and Vivarium links
+
+`/api/vivarium?url=` accepts TMDB movie/episode URLs and Vivarium `/m/...`
+or `/s/...` URLs. A TMDB season/episode URL supplies its own coordinates;
+for a series URL without them, pass `s` and `e` separately.
+
+Vivarium watch URLs use `w=1` to open the player, `e` for the episode within
+the selected anime entry, and `a` for its AniList ID. The `s` in the path
+`/s/<slug>-<id>` means “series”; it is not a season number. When a Vivarium
+series URL has `a` but no explicit season, the API reads Vivarium's `/api/cours`
+mapping to translate the AniList course and its local episode number into the
+TMDB season and episode coordinates used for streaming. `w` is a player-mode
+flag, not a season index.
+
+For example, Bleach's AniList ID `116674` maps episode 3 to TMDB S2E3, while
+AniList ID `159322` starts at TMDB S2E14, so its episode 3 resolves to S2E16.
+This mapping comes from Vivarium's current course data rather than a
+hard-coded title list:
+
+```
+GET /api/vivarium?url=https%3A%2F%2Fwww.themoviedb.org%2Ftv%2F30984%2Fseason%2F2%2Fepisode%2F3&server=vexa
+GET /api/vivarium?url=https%3A%2F%2Fvivarium.su%2Fs%2Fbleach-30984%3Fw%3D1%26a%3D159322%26e%3D3&server=vexa
+```
+
+The endpoint also continues to accept explicit `id`, `type`, `s`, and `e`
+parameters. Use either `url` or `id`/`type`; do not combine them.
 
 The dashboard endpoints expose process-local counters and cache state; values
 reset when the service restarts. `/api/health-vivarium` separately checks the
