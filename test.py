@@ -4,13 +4,14 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from api import (
     SERVERS,
+    anihub_fetch_dual_audio_by_tmdb,
     anihub_fetch_streams_by_tmdb,
+    resolve_anihub_course,
     aw_get_servers,
     filter_streams,
     health_vivarium,
     is_dub,
     is_japanese_audio,
-    resolve_anihub_course,
     vivarium,
 )
 
@@ -53,7 +54,7 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("api.race_streams", side_effect=delayed_vivarium),
-            patch("api.anihub_fetch_streams_by_tmdb",
+            patch("api.anihub_fetch_dual_audio_by_tmdb",
                   side_effect=fast_anihub),
             patch("api._usable_hls_stream", return_value=True),
             patch("api._cache_get", return_value=None),
@@ -69,6 +70,146 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             response["result"]["streams"][0]["url"],
             vivarium_stream["url"])
+
+    async def test_returns_labeled_vivarium_profile_fallback(self):
+        dub_stream = {
+            "url": "https://vivarium.example/dub.m3u8",
+            "type": "hls",
+            "quality": "1080p Dub",
+            "provider": "Iris",
+            "subs": [{"url": "https://vivarium.example/en.vtt",
+                      "lang": "en", "label": "English"}],
+        }
+        request = Mock()
+        request.app.state.http = self.client
+
+        with (
+            patch("api._cache_get", return_value=None),
+            patch("api._cached_upstream",
+                  new=AsyncMock(return_value={"streams": [dub_stream]})),
+            patch("api._cache_put"),
+            patch("api.anihub_fetch_dual_audio_by_tmdb",
+                  new=AsyncMock(return_value=[])) as anihub_lookup,
+        ):
+            response = await vivarium(
+                request, id="61663", type="tv", s="1", e="1",
+                server="vexa", race=False)
+
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(response["result"]["streams"][0]["url"],
+                         dub_stream["url"])
+        self.assertEqual(response["result"]["streams"][0]["server"], "Aster")
+        self.assertEqual(response["result"]["fallback"]["requested_server"],
+                         "vexa")
+        self.assertEqual(response["result"]["fallback"]["served_server"],
+                         "aster")
+        anihub_lookup.assert_not_awaited()
+
+    async def test_dual_audio_lookup_scrapes_sub_and_dub_concurrently(self):
+        async def fetch_for_audio(tmdb_id, season, episode, audio, client,
+                                  first_only=False, resolved_course=None):
+            return [{
+                "url": f"https://anihub.example/{audio}.m3u8",
+                "type": "hls",
+                "audio": audio,
+                "provider": "aniwaves",
+            }]
+
+        with (
+            patch("api.resolve_anihub_course",
+                  new=AsyncMock(return_value=(20665, 1))),
+            patch("api.anihub_fetch_streams_by_tmdb",
+                  side_effect=fetch_for_audio) as fetch,
+        ):
+            streams = await anihub_fetch_dual_audio_by_tmdb(
+                61663, 1, 1, self.client, first_only=True)
+
+        self.assertEqual({stream["audio"] for stream in streams},
+                         {"sub", "dub"})
+        self.assertEqual(fetch.await_count, 2)
+
+    async def test_resolves_empty_vivarium_course_for_verified_single_season(self):
+        def response(payload):
+            result = Mock()
+            result.status_code = 200
+            result.json.return_value = payload
+            return result
+
+        self.client.get.side_effect = [
+            response({"mode": "tmdb", "cours": []}),
+            response({
+                "name": "Your Lie in April",
+                "first_air_date": "2014-10-10",
+                "number_of_seasons": 1,
+            }),
+            response({"episodes": [
+                {"episode_number": number}
+                for number in (1, 2, *range(4, 24))
+            ]}),
+        ]
+        self.client.post.return_value = response({
+            "data": {"Page": {"media": [{
+                "id": 20665,
+                "idMal": 23273,
+                "episodes": 22,
+                "seasonYear": 2014,
+                "title": {
+                    "english": "Your Lie in April",
+                    "romaji": "Shigatsu wa Kimi no Uso",
+                    "native": "四月は君の嘘",
+                },
+            }]}}
+        })
+
+        with (
+            patch.dict("os.environ", {
+                "TMDB_API_READ_ACCESS_TOKEN": "test-token",
+            }),
+            patch("api._cache_get", return_value=None),
+            patch("api._cache_put"),
+            patch("api._cache_anihub"),
+        ):
+            course, episode = await resolve_anihub_course(
+                61663, 1, 4, self.client)
+
+        self.assertEqual((course, episode), (20665, 3))
+        self.assertEqual(self.client.get.await_count, 3)
+        self.client.post.assert_awaited_once()
+
+    async def test_anihub_fallback_selects_requested_audio_profile(self):
+        anihub_streams = [
+            {
+                "url": "https://anihub.example/sub.m3u8",
+                "type": "hls",
+                "audio": "sub",
+                "provider": "aniwaves",
+            },
+            {
+                "url": "https://anihub.example/dub.m3u8",
+                "type": "hls",
+                "audio": "dub",
+                "provider": "aniwaves",
+            },
+        ]
+        request = Mock()
+        request.app.state.http = self.client
+
+        with (
+            patch("api._cache_get", return_value=None),
+            patch("api._cached_upstream",
+                  new=AsyncMock(return_value={"streams": []})),
+            patch("api._cache_put"),
+            patch("api.anihub_fetch_dual_audio_by_tmdb",
+                  new=AsyncMock(return_value=anihub_streams)),
+        ):
+            response = await vivarium(
+                request, id="61663", type="tv", s="1", e="1",
+                server="vexa", race=False)
+
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(len(response["result"]["streams"]), 1)
+        self.assertEqual(response["result"]["streams"][0]["audio"], "sub")
+        self.assertEqual(response["result"]["streams"][0]["server"], "Vexa")
 
     async def test_maps_tmdb_position_to_course_local_episode(self):
         course, episode = await resolve_anihub_course(

@@ -64,10 +64,11 @@ usable matching HLS source. Callers only provide a TMDB ID and, for TV, TMDB
 season and episode; AniList identifiers are resolved internally from
 Vivarium's `/api/cours` ranges.
 
-AniHub streams are returned through the **same `/api/vivarium` endpoint** with
-only two public server labels: **Aster** for English-dub audio and **Vexa**
-for Japanese audio with English subtitles. Internal AniHub/Vivarium provider
-names are never exposed as additional servers.
+AniHub's Japanese-sub and English-dub searches run concurrently. Their results
+are returned through the **same `/api/vivarium` endpoint** with only two public
+server labels: **Aster** for English-dub audio and **Vexa** for Japanese audio
+with English subtitles. Internal AniHub/Vivarium provider names are never
+exposed as additional servers.
 
 The AniHub scraper resolves the course once, then probes AniWaves, Anikoto,
 and 2dhive concurrently. In the default mode its result is held as a fallback
@@ -77,6 +78,19 @@ serve as a fallback. AniHub fallback responses are not cached as the preferred
 result, so later requests recheck Vivarium. A 404 still means neither source
 produced a usable matching HLS link for that request; stream availability
 cannot be guaranteed when upstream providers have no working source.
+
+The optional `anilist_tmdb_mapping.json` file only supplies AniHub title/MAL
+search metadata. Its absence does not disable Vivarium source lookup. When
+Vivarium has no course ranges, the service can resolve a **verified
+single-season** anime generically using TMDB show/season metadata and AniList
+title, release year, and episode-count checks. This fallback requires
+`TMDB_API_READ_ACCESS_TOKEN` in the API process environment; it maps TMDB
+episode ordering to AniList episode ordering rather than assuming the episode
+numbers are identical. On Render, add the token in the service environment
+settings; the blueprint declares it as an unsynced secret. Multi-season or
+ambiguous matches are deliberately not guessed; those need valid Vivarium
+course ranges. If neither mapping path can verify the episode, the AniHub
+fallback is skipped and the regular Vivarium lookup still runs.
 
 ## Searching for a show
 
@@ -159,7 +173,10 @@ Use either `url` or `id`/`type`:
 If both `url` and `id`/`type` are supplied, the API returns a 400 error. The
 URL host must be `themoviedb.org` or `vivarium.su` (including their `www`
 subdomains). TV links must resolve to both a season and episode before stream
-lookup.
+lookup. If the requested audio profile has no Vivarium source but the other
+profile does, the API returns the available Vivarium stream with its actual
+Aster/Vexa label and a `fallback` object explaining the profile mismatch. The
+stream is not relabeled as the requested audio.
 
 ### Existing ID-based requests
 

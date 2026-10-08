@@ -118,18 +118,30 @@ _ANIHUB_CACHE_LOCK = threading.Lock()
 def _load_anihub_mapping():
     """Load optional AniList title/MAL metadata for AniHub searches."""
     global _ANIHUB_MAPPING
+    mapping_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "anilist_tmdb_mapping.json")
+    if not os.path.isfile(mapping_path):
+        _ANIHUB_MAPPING = {}
+        return
     try:
-        with open("anilist_tmdb_mapping.json", "r", encoding="utf-8") as f:
+        with open(mapping_path, "r", encoding="utf-8") as f:
             data = json.load(f)
             _ANIHUB_MAPPING = {entry["anilist_id"]: entry for entry in data.get("entries", [])}
         print(f"Loaded {len(_ANIHUB_MAPPING)} AniHub mappings")
     except Exception as e:
-        print(f"Warning: Could not load AniHub mapping: {e}")
+        logging.getLogger("vivarium.anihub").warning(
+            "Optional AniHub metadata could not be loaded from %s: %s",
+            mapping_path, e)
         _ANIHUB_MAPPING = {}
 
 
 def _get_anihub_mapping(anilist_id: int) -> dict | None:
     return _ANIHUB_MAPPING.get(anilist_id)
+
+
+def _normalize_title(title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", title.lower())
 
 
 def _cache_anihub(key: str, data: dict) -> None:
@@ -479,16 +491,18 @@ async def resolve_anihub_course(
                 f"{VIV}/api/cours", params={"id": tmdb_id},
                 timeout=httpx.Timeout(connect=3, read=8, write=3, pool=3))
             if response.status_code != 200:
-                return None, tmdb_episode
-            payload = response.json()
-            courses = payload.get("cours") if isinstance(payload, dict) else None
-            if not isinstance(courses, list):
-                return None, tmdb_episode
-            _cache_put(_UPSTREAM_CACHE, cache_key, courses)
+                courses = []
+            else:
+                payload = response.json()
+                courses = payload.get("cours") if isinstance(payload, dict) else None
+                if not isinstance(courses, list):
+                    courses = []
+                else:
+                    _cache_put(_UPSTREAM_CACHE, cache_key, courses)
     except (httpx.HTTPError, ValueError):
         _LOG.warning("AniHub course mapping unavailable for TMDB %s S%sE%s",
                      tmdb_id, tmdb_season, tmdb_episode)
-        return None, tmdb_episode
+        courses = []
 
     for course in courses:
         if not isinstance(course, dict) or not str(course.get("al", "")).isdigit():
@@ -514,7 +528,137 @@ async def resolve_anihub_course(
             course_episode += last - first + 1
         if not valid_course:
             continue
-    return None, tmdb_episode
+    fallback = await _resolve_simple_anime_course(
+        tmdb_id, tmdb_season, tmdb_episode, client)
+    return fallback if fallback else (None, tmdb_episode)
+
+
+async def _resolve_simple_anime_course(
+        tmdb_id: int, tmdb_season: int, tmdb_episode: int,
+        client: httpx.AsyncClient) -> tuple[int, int] | None:
+    """Resolve only verified one-season TMDB/AniList title matches."""
+    if tmdb_season != 1 or tmdb_episode < 1:
+        return None
+    token = os.environ.get("TMDB_API_READ_ACCESS_TOKEN")
+    if not token:
+        _LOG.warning(
+            "Cannot resolve AniHub single-season mapping for TMDB %s: "
+            "TMDB_API_READ_ACCESS_TOKEN is not configured",
+            tmdb_id)
+        return None
+
+    cache_key = f"anihub:simple-course:{tmdb_id}:{tmdb_episode}"
+    cached = _cache_get(_UPSTREAM_CACHE, cache_key, _COURSE_CACHE_TTL)
+    if cached is not None:
+        return cached
+
+    headers = {"Authorization": f"Bearer {token}",
+               "Accept": "application/json"}
+    timeout = httpx.Timeout(connect=3, read=6, write=3, pool=3)
+    try:
+        show_response = await client.get(
+            f"https://api.themoviedb.org/3/tv/{tmdb_id}",
+            headers=headers, timeout=timeout)
+        if show_response.status_code != 200:
+            return None
+        show = show_response.json()
+        if not isinstance(show, dict) or show.get("number_of_seasons") != 1:
+            return None
+
+        title = show.get("name")
+        first_air_date = show.get("first_air_date") or ""
+        if not isinstance(title, str) or not title.strip():
+            return None
+        year_match = re.match(r"^(\d{4})-", first_air_date)
+        if not year_match:
+            return None
+        year = int(year_match.group(1))
+
+        season_response = await client.get(
+            f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/1",
+            headers=headers, timeout=timeout)
+        if season_response.status_code != 200:
+            return None
+        season_data = season_response.json()
+        episodes = season_data.get("episodes") if isinstance(
+            season_data, dict) else None
+        if (not isinstance(episodes, list)
+                or any(not isinstance(item, dict)
+                       or not isinstance(item.get("episode_number"), int)
+                       for item in episodes)):
+            return None
+        ordered_episodes = sorted(
+            episodes, key=lambda item: item["episode_number"])
+        tmdb_position = next(
+            (index + 1 for index, item in enumerate(ordered_episodes)
+             if isinstance(item, dict)
+             and item.get("episode_number") == tmdb_episode),
+            None)
+        if tmdb_position is None:
+            return None
+
+        anilist_response = await client.post(
+            "https://graphql.anilist.co",
+            json={
+                "query": (
+                    "query ($search: String!, $year: Int!) { "
+                    "Page(page: 1, perPage: 10) { media(search: $search, "
+                    "type: ANIME, seasonYear: $year) { id idMal episodes "
+                    "seasonYear title { english romaji native } } } }"),
+                "variables": {"search": title, "year": year},
+            },
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json"},
+            timeout=timeout)
+        if anilist_response.status_code != 200:
+            return None
+        payload = anilist_response.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        page = data.get("Page") if isinstance(data, dict) else None
+        candidates = page.get("media") if isinstance(page, dict) else None
+        if not isinstance(candidates, list):
+            return None
+        normalized_title = _normalize_title(title)
+        matches = []
+        for media in candidates:
+            if not isinstance(media, dict):
+                continue
+            titles = media.get("title") or {}
+            if not isinstance(titles, dict):
+                continue
+            names = (titles.get("english"), titles.get("romaji"),
+                     titles.get("native"))
+            if (media.get("seasonYear") == year
+                    and media.get("episodes") == len(episodes)
+                    and normalized_title in {
+                        _normalize_title(name)
+                        for name in names if isinstance(name, str)}):
+                matches.append(media)
+        if len(matches) != 1:
+            _LOG.warning(
+                "AniHub single-season mapping for TMDB %s was not unique "
+                "(title=%r, year=%s, episodes=%s, matches=%s)",
+                tmdb_id, title, year, len(episodes), len(matches))
+            return None
+
+        resolved = (int(matches[0]["id"]), tmdb_position)
+        names = matches[0].get("title") or {}
+        matched_title = next(
+            (name for name in (names.get("english"), names.get("romaji"),
+                               names.get("native"))
+             if isinstance(name, str)
+             and _normalize_title(name) == normalized_title),
+            title)
+        _cache_anihub(
+            f"anilist:metadata:{resolved[0]}",
+            {"title": matched_title, "mal_id": matches[0].get("idMal")})
+        _cache_put(_UPSTREAM_CACHE, cache_key, resolved)
+        return resolved
+    except (httpx.HTTPError, ValueError, TypeError, KeyError):
+        _LOG.warning(
+            "Single-season AniHub mapping failed for TMDB %s S1E%s",
+            tmdb_id, tmdb_episode, exc_info=True)
+        return None
 
 
 def _fetch_anihub_provider(
@@ -627,10 +771,13 @@ def _fetch_anihub_provider(
 async def anihub_fetch_streams_by_tmdb(
         tmdb_id: int, tmdb_season: int, tmdb_episode: int,
         audio: str, client: httpx.AsyncClient,
-        first_only: bool = False) -> list:
+        first_only: bool = False,
+        resolved_course: tuple[int | None, int] | None = None) -> list:
     """Find AniHub sources using the TMDB coordinates supplied by the caller."""
-    anilist_id, source_episode = await resolve_anihub_course(
-        tmdb_id, tmdb_season, tmdb_episode, client)
+    if resolved_course is None:
+        resolved_course = await resolve_anihub_course(
+            tmdb_id, tmdb_season, tmdb_episode, client)
+    anilist_id, source_episode = resolved_course
     if anilist_id is None:
         return []
 
@@ -702,6 +849,46 @@ async def anihub_fetch_streams_by_tmdb(
     return streams
 
 
+async def anihub_fetch_dual_audio_by_tmdb(
+        tmdb_id: int, tmdb_season: int, tmdb_episode: int,
+        client: httpx.AsyncClient, first_only: bool = False) -> list:
+    """Resolve both AniHub audio profiles concurrently for one TMDB episode."""
+    resolved_course = await resolve_anihub_course(
+        tmdb_id, tmdb_season, tmdb_episode, client)
+    if resolved_course[0] is None:
+        return []
+    results = await asyncio.gather(
+        *(
+            anihub_fetch_streams_by_tmdb(
+                tmdb_id, tmdb_season, tmdb_episode, audio, client,
+                first_only=first_only, resolved_course=resolved_course)
+            for audio in ("sub", "dub")
+        ),
+        return_exceptions=True,
+    )
+    streams = []
+    seen = set()
+    for audio, result in zip(("sub", "dub"), results):
+        if isinstance(result, Exception):
+            _LOG.warning("AniHub %s audio lookup failed: %s", audio, result)
+            continue
+        for stream in result:
+            if not isinstance(stream, dict):
+                continue
+            stream_audio = stream.get("audio")
+            if stream_audio != audio:
+                _LOG.warning(
+                    "AniHub %s lookup returned mismatched audio metadata",
+                    audio)
+                continue
+            key = (stream.get("url"), stream_audio)
+            if key in seen:
+                continue
+            seen.add(key)
+            streams.append(stream)
+    return streams
+
+
 def _filter_anihub_streams(
         streams: list, server: Optional[str], dub: bool,
         provider: Optional[str]) -> list:
@@ -712,8 +899,6 @@ def _filter_anihub_streams(
         if server and audio != ("dub" if server.lower() == "aster" else "sub"):
             continue
         if not server and dub and audio != "dub":
-            continue
-        if not server and not dub and audio != "sub":
             continue
         source_provider = (stream.get("provider") or "").lower()
         if provider_key and provider_key not in (
@@ -1093,6 +1278,33 @@ def filter_streams(data: dict, dub: bool = False, provider: Optional[str] = None
             "qualities": quality_list(filtered)}
 
 
+def _vivarium_profile_fallback(
+        payload: dict, server: Optional[str], dub: bool,
+        provider: Optional[str]) -> dict | None:
+    requested = (server or ("aster" if dub else "")).lower()
+    if requested not in ("aster", "vexa"):
+        return None
+
+    fallback_server = "vexa" if requested == "aster" else "aster"
+    result = filter_streams(payload, provider=provider, server=fallback_server)
+    result["streams"] = [
+        stream for stream in result["streams"]
+        if _usable_hls_stream(stream)]
+    if not result["streams"]:
+        return None
+
+    result["qualities"] = quality_list(result["streams"])
+    result["fallback"] = {
+        "requested_server": requested,
+        "served_server": fallback_server,
+        "reason": (
+            f"No usable {requested} Vivarium stream was found for this "
+            f"episode; returned the available {fallback_server} Vivarium "
+            "stream instead."),
+    }
+    return result
+
+
 def parse_quality(s: dict) -> dict:
     """Normalize one stream's quality label into comparable fields."""
     q = (s.get("quality") or "").strip() or "Auto"
@@ -1410,7 +1622,6 @@ async def vivarium(
     tmdb_id = int(id)
     tmdb_season = int(s) if s else 1
     tmdb_episode = int(e) if e else 1
-    audio = "dub" if (server and server.lower() == "aster") or (dub and not server) else "sub"
     anihub_race_completed = False
     anihub_race_streams = []
     if race:
@@ -1419,8 +1630,8 @@ async def vivarium(
             provider, timings))
         pending = {vivarium_task}
         if type == "tv":
-            anihub_task = asyncio.create_task(anihub_fetch_streams_by_tmdb(
-                tmdb_id, tmdb_season, tmdb_episode, audio, client,
+            anihub_task = asyncio.create_task(anihub_fetch_dual_audio_by_tmdb(
+                tmdb_id, tmdb_season, tmdb_episode, client,
                 first_only=True))
             pending.add(anihub_task)
         while pending:
@@ -1484,13 +1695,23 @@ async def vivarium(
             timings["response_generation"] = (time.perf_counter() - started) * 1000
             _log_timing(timings)
             return result
+        profile_fallback = _vivarium_profile_fallback(
+            payload, server, dub, provider)
+        if profile_fallback:
+            timings["profile_fallback"] = True
+            _cache_put(_CACHE, key, profile_fallback)
+            _record_lookup(False)
+            result = {"status": 200, "result": profile_fallback}
+            _log_timing(timings)
+            return result
     # Vivarium upstream returned no usable streams - try AniHub fallback
     anihub_streams = []
     if type == "tv":
         anihub_streams = (
             anihub_race_streams if anihub_race_completed
-            else await anihub_fetch_streams_by_tmdb(
-                tmdb_id, tmdb_season, tmdb_episode, audio, client))
+            else await anihub_fetch_dual_audio_by_tmdb(
+                tmdb_id, tmdb_season, tmdb_episode, client,
+                first_only=True))
     if anihub_streams:
         filtered = _filter_anihub_streams(anihub_streams, server, dub, provider)
         if filtered:

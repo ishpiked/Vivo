@@ -18,3 +18,7 @@ services:
         sync: false
       - key: VIVARIUM_ADMIN_PASSWORD
         sync: false
+      # Used only when Vivarium has no course mapping for a verified
+      # single-season AniHub fallback.
+      - key: TMDB_API_READ_ACCESS_TOKEN
+        sync: false
