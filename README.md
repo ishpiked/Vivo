@@ -81,16 +81,16 @@ cannot be guaranteed when upstream providers have no working source.
 
 The optional `anilist_tmdb_mapping.json` file only supplies AniHub title/MAL
 search metadata. Its absence does not disable Vivarium source lookup. When
-Vivarium has no course ranges, the service can resolve a **verified
-single-season** anime generically using TMDB show/season metadata and AniList
-title, release year, and episode-count checks. This fallback requires
-`TMDB_API_READ_ACCESS_TOKEN` in the API process environment; it maps TMDB
-episode ordering to AniList episode ordering rather than assuming the episode
-numbers are identical. On Render, add the token in the service environment
-settings; the blueprint declares it as an unsynced secret. Multi-season or
-ambiguous matches are deliberately not guessed; those need valid Vivarium
-course ranges. If neither mapping path can verify the episode, the AniHub
-fallback is skipped and the regular Vivarium lookup still runs.
+Vivarium has no course ranges, a generic fallback searches AniList for a
+season identity match, then maps the selected TMDB episode using its TVDB
+episode ID when available, followed by exact episode-title and air-date
+matches from AniZip. This fallback requires
+`TMDB_API_READ_ACCESS_TOKEN` in the API process environment; on Render, add
+the token in the service environment settings (the blueprint declares it as
+an unsynced secret). It does not assume TMDB and AniList episode numbers are
+interchangeable. If upstream metadata cannot uniquely identify the season
+and episode, the AniHub fallback is skipped rather than returning a
+potentially incorrect episode; the regular Vivarium lookup still runs.
 
 ## Searching for a show
 

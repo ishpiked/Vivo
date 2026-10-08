@@ -61,10 +61,10 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
             patch("api._cache_put"),
         ):
             response = await vivarium(
-                request, id="900001", type="tv", s="1", e="1",
-                server="aster", race=True)
+                request, id="900001", type="tv", url=None, s="1", e="1",
+                dub=False, provider=None, server="aster", race=True)
 
-        self.assertEqual(response["status"], 200)
+        self.assertEqual(response["status"], 200, response)
         self.assertEqual(
             response["result"]["streams"][0]["provider"], "Vivarium Source")
         self.assertEqual(
@@ -92,10 +92,10 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
                   new=AsyncMock(return_value=[])) as anihub_lookup,
         ):
             response = await vivarium(
-                request, id="61663", type="tv", s="1", e="1",
-                server="vexa", race=False)
+                request, id="61663", type="tv", url=None, s="1", e="1",
+                dub=False, provider=None, server="vexa", race=False)
 
-        self.assertEqual(response["status"], 200)
+        self.assertEqual(response["status"], 200, response)
         self.assertEqual(response["result"]["streams"][0]["url"],
                          dub_stream["url"])
         self.assertEqual(response["result"]["streams"][0]["server"], "Aster")
@@ -128,7 +128,7 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
                          {"sub", "dub"})
         self.assertEqual(fetch.await_count, 2)
 
-    async def test_resolves_empty_vivarium_course_for_verified_single_season(self):
+    async def test_maps_tmdb_episode_with_anizip_metadata(self):
         def response(payload):
             result = Mock()
             result.status_code = 200
@@ -142,10 +142,17 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
                 "first_air_date": "2014-10-10",
                 "number_of_seasons": 1,
             }),
-            response({"episodes": [
-                {"episode_number": number}
-                for number in (1, 2, *range(4, 24))
+            response({"air_date": "2014-10-10", "episodes": [
+                {
+                    "episode_number": number,
+                    "name": "Departure" if number == 4 else f"Episode {number}",
+                    "air_date": (
+                        "2014-10-31" if number == 4
+                        else f"2014-10-{number:02d}"),
+                }
+                for number in range(1, 23)
             ]}),
+            response({"tvdb_id": 999}),
         ]
         self.client.post.return_value = response({
             "data": {"Page": {"media": [{
@@ -160,6 +167,19 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
                 },
             }]}}
         })
+        self.client.get.side_effect.append(response({
+            "episodes": {
+                "1": {
+                    "airDate": "2014-10-10",
+                    "title": {"en": "Monotone / Colorful"},
+                },
+                "2": {"airDate": "2014-10-17",
+                      "title": {"en": "Friend A"}},
+                "3": {"airDate": "2014-10-31",
+                      "tvdbId": 999,
+                      "title": {"en": "Departure"}},
+            },
+        }))
 
         with (
             patch.dict("os.environ", {
@@ -173,8 +193,85 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
                 61663, 1, 4, self.client)
 
         self.assertEqual((course, episode), (20665, 3))
-        self.assertEqual(self.client.get.await_count, 3)
+        self.assertEqual(self.client.get.await_count, 5)
         self.client.post.assert_awaited_once()
+
+    async def test_maps_later_season_to_ani_list_episode_number(self):
+        def response(payload):
+            result = Mock()
+            result.status_code = 200
+            result.json.return_value = payload
+            return result
+
+        self.client.get.side_effect = [
+            response({"mode": "tmdb", "cours": []}),
+            response({
+                "name": "One-Punch Man",
+                "original_name": "ワンパンマン",
+            }),
+            response({
+                "air_date": "2019-04-02",
+                "episodes": [
+                    {
+                        "episode_number": number,
+                        "name": (
+                            "Return of the Hero" if number == 7
+                            else f"Episode {number}"),
+                        "air_date": f"2019-04-{number + 1:02d}",
+                    }
+                    for number in range(1, 13)
+                ],
+            }),
+            response({"tvdb_id": 123}),
+        ]
+        self.client.post.return_value = response({
+            "data": {"Page": {"media": [{
+                "id": 97668,
+                "idMal": 34134,
+                "episodes": 24,
+                "seasonYear": 2019,
+                "title": {
+                    "english": "One-Punch Man 2",
+                    "romaji": "One Punch Man 2",
+                    "native": "ワンパンマン",
+                },
+            }]}}
+        })
+        self.client.get.side_effect.append(response({
+            "episodes": {
+                "5": {
+                    "airDate": "2019-05-07",
+                    "tvdbId": 123,
+                    "title": {"en": "Return of the Hero"},
+                },
+            },
+        }))
+
+        with (
+            patch.dict("os.environ", {
+                "TMDB_API_READ_ACCESS_TOKEN": "test-token",
+            }),
+            patch("api._cache_get", return_value=None),
+            patch("api._cache_put"),
+            patch("api._cache_anihub"),
+        ):
+            course, episode = await resolve_anihub_course(
+                63926, 2, 7, self.client)
+
+        self.assertEqual((course, episode), (97668, 5))
+        self.assertEqual(
+            self.client.get.await_args_list[2].args[0],
+            "https://api.themoviedb.org/3/tv/63926/season/2")
+
+    async def test_course_resolver_rejects_episodes_outside_configured_ranges(self):
+        self.response.json.return_value = {"cours": [
+            {"al": 185874, "r": [[3, 7, 19]]},
+        ]}
+        course, episode = await resolve_anihub_course(
+            30984, 3, 7, self.client)
+
+        self.assertEqual(course, 185874)
+        self.assertEqual(episode, 1)
 
     async def test_anihub_fallback_selects_requested_audio_profile(self):
         anihub_streams = [
@@ -203,13 +300,60 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
                   new=AsyncMock(return_value=anihub_streams)),
         ):
             response = await vivarium(
-                request, id="61663", type="tv", s="1", e="1",
-                server="vexa", race=False)
+                request, id="61663", type="tv", url=None, s="1", e="1",
+                dub=False, provider=None, server="vexa", race=False)
 
-        self.assertEqual(response["status"], 200)
+        self.assertEqual(response["status"], 200, response)
         self.assertEqual(len(response["result"]["streams"]), 1)
         self.assertEqual(response["result"]["streams"][0]["audio"], "sub")
         self.assertEqual(response["result"]["streams"][0]["server"], "Vexa")
+
+    async def test_anihub_fallback_survives_vivarium_signing_failure(self):
+        anihub_streams = [{
+            "url": "https://anihub.example/sub.m3u8",
+            "type": "hls",
+            "audio": "sub",
+            "provider": "aniwaves",
+        }]
+        request = Mock()
+        request.app.state.http = self.client
+
+        with (
+            patch("api._cache_get", return_value=None),
+            patch("api._cached_upstream",
+                  new=AsyncMock(side_effect=RuntimeError(
+                      "Vivarium request signing failed"))),
+            patch("api.anihub_fetch_dual_audio_by_tmdb",
+                  new=AsyncMock(return_value=anihub_streams)),
+        ):
+            response = await vivarium(
+                request, id="61663", type="tv", url=None, s="1", e="1",
+                dub=False, provider=None, server="vexa", race=False)
+
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(response["result"]["streams"][0]["server"], "Vexa")
+
+    async def test_signing_failure_returns_gateway_error_without_fallback(self):
+        request = Mock()
+        request.app.state.http = self.client
+
+        with (
+            patch("api._cache_get", return_value=None),
+            patch("api._cached_upstream",
+                  new=AsyncMock(side_effect=RuntimeError(
+                      "Vivarium request signing failed"))),
+            patch("api.anihub_fetch_dual_audio_by_tmdb",
+                  new=AsyncMock(return_value=[])),
+        ):
+            response = await vivarium(
+                request, id="61663", type="tv", url=None, s="1", e="1",
+                dub=False, provider=None, server="vexa", race=False)
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.body, (
+            b'{"status":502,"result":"","error":"Vivarium upstream lookup failed",'
+            b'"code":"upstream_unavailable",'
+            b'"hint":"Vivarium request signing failed"}'))
 
     async def test_maps_tmdb_position_to_course_local_episode(self):
         course, episode = await resolve_anihub_course(

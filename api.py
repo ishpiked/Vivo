@@ -48,6 +48,7 @@ from html.parser import HTMLParser
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
+import requests
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -536,18 +537,19 @@ async def resolve_anihub_course(
 async def _resolve_simple_anime_course(
         tmdb_id: int, tmdb_season: int, tmdb_episode: int,
         client: httpx.AsyncClient) -> tuple[int, int] | None:
-    """Resolve only verified one-season TMDB/AniList title matches."""
-    if tmdb_season != 1 or tmdb_episode < 1:
+    """Resolve a TMDB episode using AniList identity and AniZip episode data."""
+    if tmdb_season < 1 or tmdb_episode < 1:
         return None
     token = os.environ.get("TMDB_API_READ_ACCESS_TOKEN")
     if not token:
         _LOG.warning(
-            "Cannot resolve AniHub single-season mapping for TMDB %s: "
+            "Cannot resolve AniHub season mapping for TMDB %s: "
             "TMDB_API_READ_ACCESS_TOKEN is not configured",
             tmdb_id)
         return None
 
-    cache_key = f"anihub:simple-course:{tmdb_id}:{tmdb_episode}"
+    cache_key = (
+        f"anihub:episode-map:v2:{tmdb_id}:{tmdb_season}:{tmdb_episode}")
     cached = _cache_get(_UPSTREAM_CACHE, cache_key, _COURSE_CACHE_TTL)
     if cached is not None:
         return cached
@@ -562,20 +564,15 @@ async def _resolve_simple_anime_course(
         if show_response.status_code != 200:
             return None
         show = show_response.json()
-        if not isinstance(show, dict) or show.get("number_of_seasons") != 1:
+        if not isinstance(show, dict):
             return None
 
         title = show.get("name")
-        first_air_date = show.get("first_air_date") or ""
         if not isinstance(title, str) or not title.strip():
             return None
-        year_match = re.match(r"^(\d{4})-", first_air_date)
-        if not year_match:
-            return None
-        year = int(year_match.group(1))
 
         season_response = await client.get(
-            f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/1",
+            f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{tmdb_season}",
             headers=headers, timeout=timeout)
         if season_response.status_code != 200:
             return None
@@ -589,28 +586,52 @@ async def _resolve_simple_anime_course(
             return None
         ordered_episodes = sorted(
             episodes, key=lambda item: item["episode_number"])
-        tmdb_position = next(
-            (index + 1 for index, item in enumerate(ordered_episodes)
-             if isinstance(item, dict)
-             and item.get("episode_number") == tmdb_episode),
+        tmdb_item = next(
+            (item for item in ordered_episodes
+             if item["episode_number"] == tmdb_episode),
             None)
-        if tmdb_position is None:
+        if tmdb_item is None:
+            return None
+        season_air_date = season_data.get("air_date") or ""
+        if not season_air_date and ordered_episodes:
+            season_air_date = ordered_episodes[0].get("air_date") or ""
+        year_match = re.match(r"^(\d{4})-", season_air_date)
+        if not year_match:
+            return None
+        year = int(year_match.group(1))
+        title_names = {
+            _normalize_title(name)
+            for name in (title, show.get("original_name"),
+                         season_data.get("name"))
+            if isinstance(name, str) and name.strip()
+        }
+        if not title_names:
             return None
 
-        anilist_response = await client.post(
+        external_ids_task = asyncio.create_task(client.get(
+            f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/"
+            f"{tmdb_season}/episode/{tmdb_episode}/external_ids",
+            headers=headers, timeout=timeout))
+        anilist_task = asyncio.create_task(client.post(
             "https://graphql.anilist.co",
             json={
                 "query": (
-                    "query ($search: String!, $year: Int!) { "
+                    "query ($search: String!) { "
                     "Page(page: 1, perPage: 10) { media(search: $search, "
-                    "type: ANIME, seasonYear: $year) { id idMal episodes "
-                    "seasonYear title { english romaji native } } } }"),
-                "variables": {"search": title, "year": year},
+                    "type: ANIME) { id idMal episodes "
+                    "seasonYear title { english romaji native } "
+                    "synonyms relations { edges { node { id idMal "
+                    "episodes seasonYear title { english romaji native } "
+                    "synonyms } } } } } }"),
+                "variables": {"search": title},
             },
             headers={"Content-Type": "application/json",
                      "Accept": "application/json"},
-            timeout=timeout)
-        if anilist_response.status_code != 200:
+            timeout=timeout))
+        anilist_response, external_ids_result = await asyncio.gather(
+            anilist_task, external_ids_task, return_exceptions=True)
+        if (isinstance(anilist_response, Exception)
+                or anilist_response.status_code != 200):
             return None
         payload = anilist_response.json()
         data = payload.get("data") if isinstance(payload, dict) else None
@@ -618,9 +639,43 @@ async def _resolve_simple_anime_course(
         candidates = page.get("media") if isinstance(page, dict) else None
         if not isinstance(candidates, list):
             return None
-        normalized_title = _normalize_title(title)
-        matches = []
+        try:
+            external_ids = (
+                external_ids_result.json()
+                if (not isinstance(external_ids_result, Exception)
+                    and external_ids_result.status_code == 200)
+                else {})
+        except (httpx.HTTPError, ValueError):
+            external_ids = {}
+        tvdb_id = (
+            external_ids.get("tvdb_id")
+            if isinstance(external_ids, dict) else None)
+        try:
+            tvdb_id = int(tvdb_id) if tvdb_id else None
+        except (TypeError, ValueError):
+            tvdb_id = None
+
+        expanded_candidates = []
+        seen_candidate_ids = set()
         for media in candidates:
+            if not isinstance(media, dict):
+                continue
+            relation_edges = (media.get("relations") or {}).get(
+                "edges", [])
+            related_media = [
+                edge.get("node") for edge in relation_edges
+                if isinstance(edge, dict)]
+            for candidate in [media, *related_media]:
+                if not isinstance(candidate, dict):
+                    continue
+                candidate_id = candidate.get("id")
+                if candidate_id in seen_candidate_ids:
+                    continue
+                seen_candidate_ids.add(candidate_id)
+                expanded_candidates.append(candidate)
+
+        matches = []
+        for media in expanded_candidates:
             if not isinstance(media, dict):
                 continue
             titles = media.get("title") or {}
@@ -628,36 +683,130 @@ async def _resolve_simple_anime_course(
                 continue
             names = (titles.get("english"), titles.get("romaji"),
                      titles.get("native"))
-            if (media.get("seasonYear") == year
-                    and media.get("episodes") == len(episodes)
-                    and normalized_title in {
-                        _normalize_title(name)
-                        for name in names if isinstance(name, str)}):
+            candidate_names = {
+                _normalize_title(name)
+                for name in (*names, *(media.get("synonyms") or []))
+                if isinstance(name, str) and name.strip()
+            }
+            title_matches = any(
+                candidate == known
+                or candidate.startswith(known)
+                or known.startswith(candidate)
+                for candidate in candidate_names
+                for known in title_names
+                if candidate and known)
+            if media.get("seasonYear") == year and title_matches:
                 matches.append(media)
-        if len(matches) != 1:
+        if not matches:
             _LOG.warning(
-                "AniHub single-season mapping for TMDB %s was not unique "
+                "AniHub season mapping for TMDB %s S%s had no identity match "
                 "(title=%r, year=%s, episodes=%s, matches=%s)",
-                tmdb_id, title, year, len(episodes), len(matches))
+                tmdb_id, tmdb_season, title, year, len(episodes),
+                len(matches))
             return None
 
-        resolved = (int(matches[0]["id"]), tmdb_position)
-        names = matches[0].get("title") or {}
+        tmdb_date = tmdb_item.get("air_date")
+        tmdb_title = {
+            _normalize_title(name)
+            for name in (tmdb_item.get("name"),
+                         tmdb_item.get("original_name"))
+            if isinstance(name, str) and name.strip()
+        }
+
+        async def fetch_anizip_episodes(media):
+            anizip_response = await client.get(
+                ANIZIP_API_URL,
+                params={"anilist_id": media["id"]},
+                headers={"Accept": "application/json"},
+                timeout=timeout)
+            if anizip_response.status_code != 200:
+                return None
+            anizip_data = anizip_response.json()
+            return (
+                anizip_data.get("episodes")
+                if isinstance(anizip_data, dict) else None)
+
+        anizip_results = await asyncio.gather(
+            *(fetch_anizip_episodes(media) for media in matches),
+            return_exceptions=True)
+        episode_matches = []
+        for media, anizip_episodes in zip(matches, anizip_results):
+            if (isinstance(anizip_episodes, Exception)
+                    or not isinstance(anizip_episodes, dict)):
+                continue
+
+            dated_matches = []
+            titled_matches = []
+            tvdb_matches = []
+            for episode_key, episode_data in anizip_episodes.items():
+                if (not isinstance(episode_data, dict)
+                        or not str(episode_key).isdigit()):
+                    continue
+                ani_date = episode_data.get("airDate") or episode_data.get(
+                    "airdate")
+                ani_titles = episode_data.get("title") or {}
+                if not isinstance(ani_titles, dict):
+                    ani_titles = {}
+                ani_title = {
+                    _normalize_title(name)
+                    for name in ani_titles.values()
+                    if isinstance(name, str) and name.strip()
+                }
+                episode_ref = (media, int(episode_key), episode_data)
+                try:
+                    ani_tvdb_id = int(episode_data.get("tvdbId") or 0)
+                except (TypeError, ValueError):
+                    ani_tvdb_id = 0
+                if tvdb_id and ani_tvdb_id == tvdb_id:
+                    tvdb_matches.append(episode_ref)
+                if tmdb_date and ani_date == tmdb_date:
+                    dated_matches.append(episode_ref)
+                if tmdb_title & ani_title:
+                    titled_matches.append(episode_ref)
+
+            # Prefer a title-and-date match. A unique exact title is useful
+            # when TMDB and AniZip record different premiere dates.
+            strong_matches = [
+                ref for ref in dated_matches
+                if ref in titled_matches
+            ]
+            if len(tvdb_matches) == 1:
+                selected = tvdb_matches
+            elif strong_matches:
+                selected = strong_matches
+            elif len(titled_matches) == 1:
+                selected = titled_matches
+            elif len(dated_matches) == 1:
+                selected = dated_matches
+            else:
+                selected = []
+            episode_matches.extend(selected)
+
+        if len(episode_matches) != 1:
+            _LOG.warning(
+                "AniHub episode mapping for TMDB %s S%sE%s was not unique "
+                "(identity_matches=%s, episode_matches=%s)",
+                tmdb_id, tmdb_season, tmdb_episode, len(matches),
+                len(episode_matches))
+            return None
+
+        media, anilist_episode, _ = episode_matches[0]
+        resolved = (int(media["id"]), anilist_episode)
+        names = media.get("title") or {}
         matched_title = next(
             (name for name in (names.get("english"), names.get("romaji"),
                                names.get("native"))
-             if isinstance(name, str)
-             and _normalize_title(name) == normalized_title),
+             if isinstance(name, str) and name.strip()),
             title)
         _cache_anihub(
             f"anilist:metadata:{resolved[0]}",
-            {"title": matched_title, "mal_id": matches[0].get("idMal")})
+            {"title": matched_title, "mal_id": media.get("idMal")})
         _cache_put(_UPSTREAM_CACHE, cache_key, resolved)
         return resolved
     except (httpx.HTTPError, ValueError, TypeError, KeyError):
         _LOG.warning(
-            "Single-season AniHub mapping failed for TMDB %s S1E%s",
-            tmdb_id, tmdb_episode, exc_info=True)
+            "AniHub season mapping failed for TMDB %s S%sE%s",
+            tmdb_id, tmdb_season, tmdb_episode, exc_info=True)
         return None
 
 
@@ -1347,7 +1496,11 @@ async def _cached_upstream(client, path_qs: str, timings: dict):
     if payload is not None:
         return payload
 
-    _, headers, cookies = await asyncio.to_thread(sign_request, path_qs)
+    try:
+        _, headers, cookies = await asyncio.to_thread(sign_request, path_qs)
+    except requests.exceptions.RequestException as ex:
+        raise RuntimeError(
+            "Vivarium request signing failed while retrieving a nonce") from ex
     started = time.perf_counter()
     response = await client.get(
         f"{VIV}{path_qs}", headers=headers, cookies=cookies,
@@ -1676,9 +1829,12 @@ async def vivarium(
                     anihub_race_streams = candidate
                     timings["anihub_ready"] = True
         # Neither source returned a matching HLS stream; use the full response path.
+    upstream_error = None
     try:
         payload = await _cached_upstream(client, path, timings)
     except (RuntimeError, httpx.HTTPError) as ex:
+        upstream_error = ex
+        _LOG.warning("Vivarium stream lookup failed: %s", ex)
         payload = None
     if payload:
         started = time.perf_counter()
@@ -1723,6 +1879,16 @@ async def vivarium(
             timings["response_generation"] = (time.perf_counter() - started) * 1000
             _log_timing(timings)
             return result
+    if upstream_error:
+        _record_lookup(True)
+        _log_timing(timings)
+        return JSONResponse(status_code=502, content={
+            "status": 502,
+            "result": "",
+            "error": "Vivarium upstream lookup failed",
+            "code": "upstream_unavailable",
+            "hint": str(upstream_error),
+        })
     _record_lookup(True)
     _log_timing(timings)
     return _no_sources_response()
