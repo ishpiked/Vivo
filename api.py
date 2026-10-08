@@ -173,6 +173,7 @@ ANIKOTO_BASE = "https://anikototv.to"
 ANIKOTO_MAPPER = "https://mapper.nekostream.site/api/mal"
 ANIZIP_API_URL = "https://api.ani.zip/mappings"
 TWODHIVE_BASE = "https://2dhive.com"
+ANIHUB_REQUEST_TIMEOUT = 5
 
 _anihub_session = None
 
@@ -194,7 +195,8 @@ def anihub_fetch_json(url: str, headers: dict = None, cache_ttl: int = 1800) -> 
         h = {"User-Agent": ANIHUB_UA, "Accept": "application/json"}
         if headers:
             h.update(headers)
-        resp = _get_anihub_session().get(url, headers=h, timeout=8)
+        resp = _get_anihub_session().get(
+            url, headers=h, timeout=ANIHUB_REQUEST_TIMEOUT)
         if resp.status_code == 200:
             data = resp.json()
             _cache_anihub(key, data)
@@ -213,7 +215,8 @@ def anihub_fetch_text(url: str, headers: dict = None, cache_ttl: int = 1800) -> 
         h = {"User-Agent": ANIHUB_UA, "Accept": "text/html,*/*"}
         if headers:
             h.update(headers)
-        resp = _get_anihub_session().get(url, headers=h, timeout=8)
+        resp = _get_anihub_session().get(
+            url, headers=h, timeout=ANIHUB_REQUEST_TIMEOUT)
         if resp.status_code == 200:
             _cache_anihub(key, {"body": resp.text})
             return resp.text
@@ -490,7 +493,7 @@ async def resolve_anihub_course(
         if courses is None:
             response = await client.get(
                 f"{VIV}/api/cours", params={"id": tmdb_id},
-                timeout=httpx.Timeout(connect=3, read=8, write=3, pool=3))
+                timeout=httpx.Timeout(connect=2, read=4, write=2, pool=2))
             if response.status_code != 200:
                 courses = []
             else:
@@ -556,8 +559,62 @@ async def _resolve_simple_anime_course(
 
     headers = {"Authorization": f"Bearer {token}",
                "Accept": "application/json"}
-    timeout = httpx.Timeout(connect=3, read=6, write=3, pool=3)
+    timeout = httpx.Timeout(connect=2, read=4, write=2, pool=2)
     try:
+        external_ids_data = None
+        direct_mapping, external_ids_response = await asyncio.gather(
+            client.get(
+                ANIZIP_API_URL,
+                params={"themoviedb_id": tmdb_id},
+                headers={"Accept": "application/json"},
+                timeout=timeout),
+            client.get(
+                f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/"
+                f"{tmdb_season}/episode/{tmdb_episode}/external_ids",
+                headers=headers, timeout=timeout),
+            return_exceptions=True)
+        if (not isinstance(direct_mapping, Exception)
+                and direct_mapping.status_code == 200
+                and not isinstance(external_ids_response, Exception)
+                and external_ids_response.status_code == 200):
+            mapping_data = direct_mapping.json()
+            ids_data = external_ids_response.json()
+            if isinstance(ids_data, dict):
+                external_ids_data = ids_data
+            anime_ids = (
+                mapping_data.get("mappings") or {}
+                if isinstance(mapping_data, dict) else {})
+            anilist_id = anime_ids.get("anilist_id")
+            tvdb_id = ids_data.get("tvdb_id") if isinstance(
+                ids_data, dict) else None
+            episode_data = (
+                mapping_data.get("episodes") or {}
+                if isinstance(mapping_data, dict) else {})
+            if anilist_id and tvdb_id and isinstance(episode_data, dict):
+                exact = []
+                for episode_number, item in episode_data.items():
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        matches_tvdb = (
+                            int(item.get("tvdbId") or 0) == int(tvdb_id))
+                    except (TypeError, ValueError):
+                        matches_tvdb = False
+                    if matches_tvdb and str(episode_number).isdigit():
+                        exact.append(int(episode_number))
+                if len(exact) == 1:
+                    titles = (
+                        mapping_data.get("titles") or {}
+                        if isinstance(mapping_data.get("titles"), dict)
+                        else {})
+                    _cache_anihub(
+                        f"anilist:metadata:{int(anilist_id)}",
+                        {"title": titles.get("en") or titles.get("x-jat"),
+                         "mal_id": anime_ids.get("mal_id")})
+                    resolved = (int(anilist_id), exact[0])
+                    _cache_put(_UPSTREAM_CACHE, cache_key, resolved)
+                    return resolved
+
         show_response = await client.get(
             f"https://api.themoviedb.org/3/tv/{tmdb_id}",
             headers=headers, timeout=timeout)
@@ -608,10 +665,12 @@ async def _resolve_simple_anime_course(
         if not title_names:
             return None
 
-        external_ids_task = asyncio.create_task(client.get(
-            f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/"
-            f"{tmdb_season}/episode/{tmdb_episode}/external_ids",
-            headers=headers, timeout=timeout))
+        external_ids_task = (
+            asyncio.create_task(client.get(
+                f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/"
+                f"{tmdb_season}/episode/{tmdb_episode}/external_ids",
+                headers=headers, timeout=timeout))
+            if external_ids_data is None else None)
         anilist_task = asyncio.create_task(client.post(
             "https://graphql.anilist.co",
             json={
@@ -628,8 +687,12 @@ async def _resolve_simple_anime_course(
             headers={"Content-Type": "application/json",
                      "Accept": "application/json"},
             timeout=timeout))
-        anilist_response, external_ids_result = await asyncio.gather(
-            anilist_task, external_ids_task, return_exceptions=True)
+        if external_ids_task:
+            anilist_response, external_ids_result = await asyncio.gather(
+                anilist_task, external_ids_task, return_exceptions=True)
+        else:
+            anilist_response = await anilist_task
+            external_ids_result = external_ids_data
         if (isinstance(anilist_response, Exception)
                 or anilist_response.status_code != 200):
             return None
@@ -640,11 +703,14 @@ async def _resolve_simple_anime_course(
         if not isinstance(candidates, list):
             return None
         try:
-            external_ids = (
-                external_ids_result.json()
-                if (not isinstance(external_ids_result, Exception)
-                    and external_ids_result.status_code == 200)
-                else {})
+            if isinstance(external_ids_result, dict):
+                external_ids = external_ids_result
+            else:
+                external_ids = (
+                    external_ids_result.json()
+                    if (not isinstance(external_ids_result, Exception)
+                        and external_ids_result.status_code == 200)
+                    else {})
         except (httpx.HTTPError, ValueError):
             external_ids = {}
         tvdb_id = (
@@ -935,7 +1001,7 @@ async def anihub_fetch_streams_by_tmdb(
     mapping = _get_anihub_mapping(anilist_id) or {}
     title = mapping.get("title") or metadata.get("title")
     mal_id = mapping.get("mal_id") or metadata.get("mal_id")
-    if not title or not mal_id:
+    if not title:
         try:
             response = await client.post(
                 "https://graphql.anilist.co",
@@ -954,7 +1020,7 @@ async def anihub_fetch_streams_by_tmdb(
                 titles = media.get("title") or {}
                 title = title or titles.get("english") or titles.get("romaji") or titles.get("native")
                 mal_id = mal_id or media.get("idMal")
-                if title and mal_id:
+                if title:
                     _cache_anihub(metadata_key, {
                         "title": title, "mal_id": mal_id})
         except (httpx.HTTPError, ValueError):
@@ -1000,8 +1066,12 @@ async def anihub_fetch_streams_by_tmdb(
 
 async def anihub_fetch_dual_audio_by_tmdb(
         tmdb_id: int, tmdb_season: int, tmdb_episode: int,
-        client: httpx.AsyncClient, first_only: bool = False) -> list:
-    """Resolve both AniHub audio profiles concurrently for one TMDB episode."""
+        client: httpx.AsyncClient, first_only: bool = False,
+        requested_audio: str | None = None) -> list:
+    """Resolve the requested AniHub audio profile(s) concurrently."""
+    audio_profiles = (
+        (requested_audio,) if requested_audio in ("sub", "dub")
+        else ("sub", "dub"))
     resolved_course = await resolve_anihub_course(
         tmdb_id, tmdb_season, tmdb_episode, client)
     if resolved_course[0] is None:
@@ -1011,13 +1081,13 @@ async def anihub_fetch_dual_audio_by_tmdb(
             anihub_fetch_streams_by_tmdb(
                 tmdb_id, tmdb_season, tmdb_episode, audio, client,
                 first_only=first_only, resolved_course=resolved_course)
-            for audio in ("sub", "dub")
+            for audio in audio_profiles
         ),
         return_exceptions=True,
     )
     streams = []
     seen = set()
-    for audio, result in zip(("sub", "dub"), results):
+    for audio, result in zip(audio_profiles, results):
         if isinstance(result, Exception):
             _LOG.warning("AniHub %s audio lookup failed: %s", audio, result)
             continue
@@ -1783,9 +1853,13 @@ async def vivarium(
             provider, timings))
         pending = {vivarium_task}
         if type == "tv":
+            requested_audio = (
+                "dub" if server and server.lower() == "aster"
+                else "sub" if server and server.lower() == "vexa"
+                else "dub" if dub else None)
             anihub_task = asyncio.create_task(anihub_fetch_dual_audio_by_tmdb(
                 tmdb_id, tmdb_season, tmdb_episode, client,
-                first_only=True))
+                first_only=True, requested_audio=requested_audio))
             pending.add(anihub_task)
         while pending:
             completed, pending = await asyncio.wait(
@@ -1863,11 +1937,15 @@ async def vivarium(
     # Vivarium upstream returned no usable streams - try AniHub fallback
     anihub_streams = []
     if type == "tv":
+        requested_audio = (
+            "dub" if server and server.lower() == "aster"
+            else "sub" if server and server.lower() == "vexa"
+            else "dub" if dub else None)
         anihub_streams = (
             anihub_race_streams if anihub_race_completed
             else await anihub_fetch_dual_audio_by_tmdb(
                 tmdb_id, tmdb_season, tmdb_episode, client,
-                first_only=True))
+                first_only=True, requested_audio=requested_audio))
     if anihub_streams:
         filtered = _filter_anihub_streams(anihub_streams, server, dub, provider)
         if filtered:

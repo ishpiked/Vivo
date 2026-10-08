@@ -128,6 +128,65 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
                          {"sub", "dub"})
         self.assertEqual(fetch.await_count, 2)
 
+    async def test_requested_server_only_scrapes_its_audio_profile(self):
+        async def fetch_for_audio(tmdb_id, season, episode, audio, client,
+                                  first_only=False, resolved_course=None):
+            return [{
+                "url": f"https://anihub.example/{audio}.m3u8",
+                "type": "hls",
+                "audio": audio,
+                "provider": "aniwaves",
+            }]
+
+        with (
+            patch("api.resolve_anihub_course",
+                  new=AsyncMock(return_value=(20665, 1))),
+            patch("api.anihub_fetch_streams_by_tmdb",
+                  side_effect=fetch_for_audio) as fetch,
+        ):
+            streams = await anihub_fetch_dual_audio_by_tmdb(
+                61663, 1, 1, self.client, first_only=True,
+                requested_audio="dub")
+
+        self.assertEqual([stream["audio"] for stream in streams], ["dub"])
+        fetch.assert_awaited_once()
+
+    async def test_fast_mapping_uses_tmdb_episode_tvdb_identity(self):
+        def response(payload):
+            result = Mock()
+            result.status_code = 200
+            result.json.return_value = payload
+            return result
+
+        self.client.get.side_effect = [
+            response({"mode": "tmdb", "cours": []}),
+            response({
+                "mappings": {"anilist_id": 20665, "mal_id": 23273},
+                "titles": {"en": "Your Lie in April"},
+                "episodes": {
+                    "1": {"tvdbId": 5001},
+                    "3": {"tvdbId": 5004},
+                },
+            }),
+            response({"tvdb_id": 5004}),
+        ]
+
+        with (
+            patch.dict("os.environ", {
+                "TMDB_API_READ_ACCESS_TOKEN": "test-token",
+            }),
+            patch("api._cache_get", return_value=None),
+            patch("api._cache_put"),
+            patch("api._cache_anihub") as cache_metadata,
+        ):
+            course, episode = await resolve_anihub_course(
+                61663, 1, 4, self.client)
+
+        self.assertEqual((course, episode), (20665, 3))
+        self.assertEqual(self.client.get.await_count, 3)
+        self.client.post.assert_not_awaited()
+        cache_metadata.assert_called_once()
+
     async def test_maps_tmdb_episode_with_anizip_metadata(self):
         def response(payload):
             result = Mock()
@@ -137,6 +196,8 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
 
         self.client.get.side_effect = [
             response({"mode": "tmdb", "cours": []}),
+            response({"status": "unmapped"}),
+            response({"status": "unmapped"}),
             response({
                 "name": "Your Lie in April",
                 "first_air_date": "2014-10-10",
@@ -152,7 +213,19 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
                 }
                 for number in range(1, 23)
             ]}),
-            response({"tvdb_id": 999}),
+            response({
+                "episodes": {
+                    "1": {
+                        "airDate": "2014-10-10",
+                        "title": {"en": "Monotone / Colorful"},
+                    },
+                    "2": {"airDate": "2014-10-17",
+                          "title": {"en": "Friend A"}},
+                    "3": {"airDate": "2014-10-31",
+                          "tvdbId": 999,
+                          "title": {"en": "Departure"}},
+                },
+            }),
         ]
         self.client.post.return_value = response({
             "data": {"Page": {"media": [{
@@ -167,20 +240,6 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
                 },
             }]}}
         })
-        self.client.get.side_effect.append(response({
-            "episodes": {
-                "1": {
-                    "airDate": "2014-10-10",
-                    "title": {"en": "Monotone / Colorful"},
-                },
-                "2": {"airDate": "2014-10-17",
-                      "title": {"en": "Friend A"}},
-                "3": {"airDate": "2014-10-31",
-                      "tvdbId": 999,
-                      "title": {"en": "Departure"}},
-            },
-        }))
-
         with (
             patch.dict("os.environ", {
                 "TMDB_API_READ_ACCESS_TOKEN": "test-token",
@@ -193,7 +252,7 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
                 61663, 1, 4, self.client)
 
         self.assertEqual((course, episode), (20665, 3))
-        self.assertEqual(self.client.get.await_count, 5)
+        self.assertEqual(self.client.get.await_count, 6)
         self.client.post.assert_awaited_once()
 
     async def test_maps_later_season_to_ani_list_episode_number(self):
@@ -205,6 +264,8 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
 
         self.client.get.side_effect = [
             response({"mode": "tmdb", "cours": []}),
+            response({"status": "unmapped"}),
+            response({"status": "unmapped"}),
             response({
                 "name": "One-Punch Man",
                 "original_name": "ワンパンマン",
@@ -222,7 +283,15 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
                     for number in range(1, 13)
                 ],
             }),
-            response({"tvdb_id": 123}),
+            response({
+                "episodes": {
+                    "5": {
+                        "airDate": "2019-05-07",
+                        "tvdbId": 123,
+                        "title": {"en": "Return of the Hero"},
+                    },
+                },
+            }),
         ]
         self.client.post.return_value = response({
             "data": {"Page": {"media": [{
@@ -237,16 +306,6 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
                 },
             }]}}
         })
-        self.client.get.side_effect.append(response({
-            "episodes": {
-                "5": {
-                    "airDate": "2019-05-07",
-                    "tvdbId": 123,
-                    "title": {"en": "Return of the Hero"},
-                },
-            },
-        }))
-
         with (
             patch.dict("os.environ", {
                 "TMDB_API_READ_ACCESS_TOKEN": "test-token",
@@ -260,7 +319,7 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual((course, episode), (97668, 5))
         self.assertEqual(
-            self.client.get.await_args_list[2].args[0],
+            self.client.get.await_args_list[4].args[0],
             "https://api.themoviedb.org/3/tv/63926/season/2")
 
     async def test_course_resolver_rejects_episodes_outside_configured_ranges(self):
