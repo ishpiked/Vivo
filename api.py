@@ -32,8 +32,11 @@ Requires: pip install fastapi uvicorn wasmtime requests
 Optional for VG auto-refresh: pip install seleniumbase (needs Chrome)
 """
 import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
+import hashlib
 import hmac
+import json
 import logging
 import os
 import re
@@ -41,6 +44,7 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from html.parser import HTMLParser
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
@@ -100,6 +104,628 @@ VIVARIUM_ID_MAP = {
         "description": "Original Naruto series, 220 episodes + specials",
     },
 }
+
+
+# ============================================================================
+# AniHub Integration: Static mappings + Providers (aniwaves, anikoto, 2dhive)
+# ============================================================================
+_ANIHUB_MAPPING: dict = {}
+_ANIHUB_CACHE: dict = {}
+_ANIHUB_CACHE_TTL = 1800  # 30 min
+_ANIHUB_CACHE_LOCK = threading.Lock()
+
+
+def _load_anihub_mapping():
+    """Load optional AniList title/MAL metadata for AniHub searches."""
+    global _ANIHUB_MAPPING
+    try:
+        with open("anilist_tmdb_mapping.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+            _ANIHUB_MAPPING = {entry["anilist_id"]: entry for entry in data.get("entries", [])}
+        print(f"Loaded {len(_ANIHUB_MAPPING)} AniHub mappings")
+    except Exception as e:
+        print(f"Warning: Could not load AniHub mapping: {e}")
+        _ANIHUB_MAPPING = {}
+
+
+def _get_anihub_mapping(anilist_id: int) -> dict | None:
+    return _ANIHUB_MAPPING.get(anilist_id)
+
+
+def _cache_anihub(key: str, data: dict) -> None:
+    with _ANIHUB_CACHE_LOCK:
+        _ANIHUB_CACHE[key] = {"data": data, "expires": time.time() + _ANIHUB_CACHE_TTL}
+
+
+def _get_cached_anihub(key: str) -> dict | None:
+    with _ANIHUB_CACHE_LOCK:
+        entry = _ANIHUB_CACHE.get(key)
+        if entry and time.time() < entry["expires"]:
+            return entry["data"]
+        if entry:
+            del _ANIHUB_CACHE[key]
+    return None
+
+
+# Load mappings at startup
+_load_anihub_mapping()
+
+
+# ============================================================================
+# AniHub Providers: aniwaves, anikoto, 2dhive
+# ============================================================================
+ANIHUB_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+ANIWAVES_BASE = "https://aniwaves.ru"
+ANIKOTO_BASE = "https://anikototv.to"
+ANIKOTO_MAPPER = "https://mapper.nekostream.site/api/mal"
+ANIZIP_API_URL = "https://api.ani.zip/mappings"
+TWODHIVE_BASE = "https://2dhive.com"
+
+_anihub_session = None
+
+
+def _get_anihub_session():
+    global _anihub_session
+    if _anihub_session is None:
+        _anihub_session = requests.Session()
+        _anihub_session.headers.update({"User-Agent": ANIHUB_UA})
+    return _anihub_session
+
+
+def anihub_fetch_json(url: str, headers: dict = None, cache_ttl: int = 1800) -> dict:
+    key = f"anihub:{hashlib.md5(url.encode()).hexdigest()}"
+    cached = _get_cached_anihub(key)
+    if cached:
+        return cached
+    try:
+        h = {"User-Agent": ANIHUB_UA, "Accept": "application/json"}
+        if headers:
+            h.update(headers)
+        resp = _get_anihub_session().get(url, headers=h, timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            _cache_anihub(key, data)
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def anihub_fetch_text(url: str, headers: dict = None, cache_ttl: int = 1800) -> str:
+    key = f"anihub:text:{hashlib.md5(url.encode()).hexdigest()}"
+    cached = _get_cached_anihub(key)
+    if cached:
+        return cached
+    try:
+        h = {"User-Agent": ANIHUB_UA, "Accept": "text/html,*/*"}
+        if headers:
+            h.update(headers)
+        resp = _get_anihub_session().get(url, headers=h, timeout=8)
+        if resp.status_code == 200:
+            _cache_anihub(key, {"body": resp.text})
+            return resp.text
+    except Exception:
+        pass
+    return ""
+
+
+# --- AniWaves Provider ---
+def aw_search(query: str) -> list:
+    try:
+        html = anihub_fetch_text(f"{ANIWAVES_BASE}/filter?keyword={urlencode({'keyword': query}).split('=')[1]}")
+        results = []
+        for m in re.finditer(r'<a\b([^>]*)>([\s\S]*?)</a>', html, re.IGNORECASE):
+            tag = m.group(1)
+            if 'class="name d-title"' not in tag:
+                continue
+            href_m = re.search(r'href="(/watch/[^"]+)"', tag)
+            if not href_m:
+                continue
+            slug = href_m.group(1).split("/")[-1]
+            id_m = re.search(r"-(\d+)$", slug)
+            title = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            if id_m:
+                results.append({"slug": slug, "site_id": int(id_m.group(1)), "title": title})
+        return results
+    except Exception:
+        return []
+
+
+def aw_resolve(anilist_id: int, media: dict = None) -> dict | None:
+    titles = []
+    if media:
+        t = media.get("title", {})
+        titles = [t.get("english"), t.get("romaji"), t.get("native")]
+        titles = [x for x in titles if x]
+    mapping = _get_anihub_mapping(anilist_id)
+    if mapping:
+        anizip = mapping.get("anizip_raw", {})
+        az_t = anizip.get("titles", {}) if isinstance(anizip, dict) else {}
+        titles.extend([az_t.get("en"), az_t.get("x-jat"), az_t.get("ja")])
+    titles = [t for t in titles if t]
+    
+    best = None
+    best_score = 0
+    for q in titles[:4]:
+        for c in aw_search(q):
+            score = len(set(q.lower().split()) & set(c["title"].lower().split()))
+            if score > best_score:
+                best_score = score
+                best = c
+    if best and best_score >= 2:
+        return best
+    return None
+
+
+def aw_get_episodes(anilist_id: int, site_id: int, slug: str) -> list:
+    try:
+        r = anihub_fetch_json(f"{ANIWAVES_BASE}/ajax/episode/list/{site_id}?vrf=")
+        eps = []
+        html = (r or {}).get("result", "")
+        for m in re.finditer(r'<a\b([^>]*)>([\s\S]*?)</a>', html, re.IGNORECASE):
+            tag = m.group(1)
+            num_m = re.search(r'data-num="(\d+)"', tag)
+            if not num_m:
+                continue
+            num = int(num_m.group(1))
+            ep_slug = re.search(r'data-slug="([^"]+)"', tag)
+            ids = re.search(r'data-ids="([^"]+)"', tag)
+            sub = 'data-sub="1"' in tag
+            dub = 'data-dub="1"' in tag
+            title = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            eps.append({"number": num, "source_number": ep_slug.group(1) if ep_slug else str(num),
+                        "ids": ids.group(1) if ids else "", "title": title,
+                        "has_sub": sub, "has_dub": dub})
+        eps.sort(key=lambda x: x["number"])
+        return eps
+    except Exception:
+        return []
+
+
+def aw_get_servers(site_id: int, source_number: str, audio: str) -> list:
+    try:
+        r = anihub_fetch_json(f"{ANIWAVES_BASE}/ajax/server/list?servers={site_id}&eps={urlencode({'eps': source_number}).split('=')[1]}")
+        html = (r or {}).get("result", "")
+
+        class ServerListParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.audio_stack = []
+                self.servers = []
+                self.current_server = None
+
+            def handle_starttag(self, tag, attrs):
+                attributes = dict(attrs)
+                if tag == "div":
+                    self.audio_stack.append(
+                        attributes.get("data-type")
+                        or (self.audio_stack[-1] if self.audio_stack else None))
+                elif tag == "li" and self.audio_stack and self.audio_stack[-1] == audio:
+                    self.current_server = {
+                        "attributes": attributes, "name": []}
+
+            def handle_data(self, data):
+                if self.current_server is not None:
+                    self.current_server["name"].append(data)
+
+            def handle_endtag(self, tag):
+                if tag == "li" and self.current_server is not None:
+                    attributes = self.current_server["attributes"]
+                    link_id = attributes.get("data-link-id")
+                    if link_id:
+                        self.servers.append({
+                            "link_id": link_id,
+                            "server_id": attributes.get("data-sv-id"),
+                            "server_name": "".join(
+                                self.current_server["name"]).strip() or "AniWaves",
+                            "audio": audio,
+                        })
+                    self.current_server = None
+                elif tag == "div" and self.audio_stack:
+                    self.audio_stack.pop()
+
+        parser = ServerListParser()
+        parser.feed(html)
+        return parser.servers
+    except Exception:
+        return []
+
+
+def aw_get_sources(link_id: str) -> dict:
+    try:
+        return anihub_fetch_json(f"{ANIWAVES_BASE}/ajax/sources?id={urlencode({'id': link_id}).split('=')[1]}&asi=0&autoPlay=0")
+    except Exception:
+        return {}
+
+
+# --- Anikoto Provider ---
+def ak_search(query: str) -> list:
+    try:
+        html = anihub_fetch_text(f"{ANIKOTO_BASE}/filter?keyword={urlencode({'keyword': query}).split('=')[1]}")
+        results = []
+        for m in re.finditer(r'href="https://anikototv\.to/watch/([^"/]+)(?:/ep-\d+)?"[^>]*data-jp="([^"]*)"[^>]*>([\s\S]*?)</a>', html):
+            slug, jp, name = m.groups()
+            results.append({"slug": slug, "jp": jp, "name": re.sub(r"<[^>]+>", "", name).strip()})
+        return results
+    except Exception:
+        return []
+
+
+def ak_resolve(anilist_id: int, media: dict = None) -> dict | None:
+    titles = []
+    if media:
+        t = media.get("title", {})
+        titles = [t.get("english"), t.get("romaji"), t.get("native")]
+        titles = [x for x in titles if x]
+    mapping = _get_anihub_mapping(anilist_id)
+    if mapping:
+        mal_id = mapping.get("mal_id")
+        if mal_id:
+            titles.insert(0, str(mal_id))
+    
+    for q in titles[:4]:
+        for c in ak_search(q):
+            if c:
+                show = anihub_fetch_json(f"{ANIKOTO_BASE}/ajax/episode/list/{c['slug']}")
+                if show and show.get("result"):
+                    show_data = anihub_fetch_json(f"{ANIKOTO_BASE}/watch/{c['slug']}")
+                    if show_data:
+                        m = re.search(r'data-id="(\d+)"', show_data)
+                        if m:
+                            c["show_id"] = m.group(1)
+                            return c
+    return None
+
+
+def ak_get_episodes(show_id: str) -> list:
+    try:
+        html = anihub_fetch_text(f"{ANIKOTO_BASE}/ajax/episode/list/{show_id}")
+        eps = []
+        for m in re.finditer(r'data-id="([^"]*)"[^>]*data-num="(\d+)"[^>]*data-sub="([^"]*)"[^>]*data-dub="([^"]*)"', html):
+            ids, num, sub, dub = m.groups()
+            eps.append({"number": int(num), "ids": ids, "has_sub": sub == "1", "has_dub": dub == "1"})
+        eps.sort(key=lambda x: x["number"])
+        return eps
+    except Exception:
+        return []
+
+
+def ak_get_servers(ids: str, audio: str) -> list:
+    try:
+        html = anihub_fetch_json(f"{ANIKOTO_BASE}/ajax/server/list?servers={urlencode({'servers': ids}).split('=')[1]}")
+        html = (html or {}).get("result", "")
+        servers = []
+        for m in re.finditer(r'<div class="type" data-type="([^"]+)">([\s\S]*?)</ul>\s*</div>', html):
+            tn, body = m.groups()
+            if tn != audio and not (audio == "sub" and tn == "hsub"):
+                continue
+            for li in re.finditer(r'<li\s+([^>]*data-link-id[^>]*)>([\s\S]*?)</li>', body):
+                link_id = re.search(r'data-link-id="([^"]+)"', li.group(1))
+                name = re.sub(r"<[^>]+>", "", li.group(2)).strip()
+                if link_id:
+                    servers.append({"link_id": link_id.group(1), "server_name": name, "audio": audio, "subtitle_type": "hardsub" if tn == "hsub" else "softsub"})
+        return servers
+    except Exception:
+        return []
+
+
+def ak_get_sources(link_id: str) -> str:
+    try:
+        r = anihub_fetch_json(f"{ANIKOTO_BASE}/ajax/server?get={urlencode({'get': link_id}).split('=')[1]}")
+        return (r or {}).get("result", {}).get("url")
+    except Exception:
+        return None
+
+
+# --- 2dhive Provider ---
+def hv_get_episodes(mal_id: int) -> list:
+    try:
+        html = anihub_fetch_text(f"{TWODHIVE_BASE}/anime?anime={mal_id}")
+        eps = []
+        for m in re.finditer(r'/episode\?anime=' + str(mal_id) + r'&ep_num=(\d+)', html):
+            eps.append(int(m.group(1)))
+        return sorted(set(eps))
+    except Exception:
+        return []
+
+
+def hv_get_servers(mal_id: int, ep_num: int, audio: str) -> list:
+    servers = []
+    # MegaPlay direct
+    servers.append({"url": f"https://megaplay.buzz/stream/mal/{mal_id}/{ep_num}/{audio}", "server_name": "MegaPlay", "audio": audio})
+    # Try hiAnime for sub
+    if audio == "sub":
+        try:
+            r = anihub_fetch_json(f"{TWODHIVE_BASE}/api/hianime?mal_id={mal_id}&ep_num={ep_num}")
+            if r and r.get("m3u8"):
+                servers.append({"url": r["m3u8"], "server_name": "hiAnime", "audio": audio, "subtitle": r.get("subtitle")})
+        except Exception:
+            pass
+    return servers
+
+
+def _fetch_first_source(fetcher, servers: list) -> tuple[dict, str] | None:
+    """Resolve alternative server links concurrently and return the first URL."""
+    if not servers:
+        return None
+    executor = ThreadPoolExecutor(max_workers=min(len(servers), 3))
+    futures = {executor.submit(fetcher, server["link_id"]): server
+               for server in servers[:3]}
+    try:
+        for future in as_completed(futures):
+            server = futures[future]
+            try:
+                result = future.result()
+            except Exception:
+                continue
+            url = result.get("url") if isinstance(result, dict) else result
+            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                return server, url
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    return None
+
+
+# --- Unified AniHub Stream Fetcher ---
+async def resolve_anihub_course(
+        tmdb_id: int, tmdb_season: int, tmdb_episode: int,
+        client: httpx.AsyncClient) -> tuple[int | None, int]:
+    """Resolve TMDB coordinates to an AniList course and course-local episode."""
+    cache_key = f"vivarium:courses:{tmdb_id}"
+    courses = _cache_get(_UPSTREAM_CACHE, cache_key, _COURSE_CACHE_TTL)
+    try:
+        if courses is None:
+            response = await client.get(
+                f"{VIV}/api/cours", params={"id": tmdb_id},
+                timeout=httpx.Timeout(connect=3, read=8, write=3, pool=3))
+            if response.status_code != 200:
+                return None, tmdb_episode
+            payload = response.json()
+            courses = payload.get("cours") if isinstance(payload, dict) else None
+            if not isinstance(courses, list):
+                return None, tmdb_episode
+            _cache_put(_UPSTREAM_CACHE, cache_key, courses)
+    except (httpx.HTTPError, ValueError):
+        _LOG.warning("AniHub course mapping unavailable for TMDB %s S%sE%s",
+                     tmdb_id, tmdb_season, tmdb_episode)
+        return None, tmdb_episode
+
+    for course in courses:
+        if not isinstance(course, dict) or not str(course.get("al", "")).isdigit():
+            continue
+        ranges = course.get("r")
+        if not isinstance(ranges, list):
+            continue
+        course_episode = 0
+        valid_course = True
+        for item in ranges:
+            if (not isinstance(item, list) or len(item) != 3
+                    or not all(str(value).isdigit() for value in item)):
+                valid_course = False
+                break
+            season, first, last = map(int, item)
+            if season < 0 or first < 1 or last < first:
+                valid_course = False
+                break
+            if (season == tmdb_season
+                    and first <= tmdb_episode <= last):
+                return int(course["al"]), (
+                    course_episode + tmdb_episode - first + 1)
+            course_episode += last - first + 1
+        if not valid_course:
+            continue
+    return None, tmdb_episode
+
+
+def _fetch_anihub_provider(
+        provider: str,
+        anilist_id: int, source_episode: int, audio: str,
+        title: str, mal_id: int | None, first_only: bool) -> list:
+    """Fetch one provider's source in a worker thread."""
+    streams = []
+
+    if provider == "aniwaves":
+        results = aw_search(title)
+        if results:
+            best = results[0]
+            eps = aw_get_episodes(anilist_id, best["site_id"], best["slug"])
+            ep = next((item for item in eps
+                       if item["number"] == source_episode), None)
+            if ep and ((audio == "sub" and ep["has_sub"])
+                       or (audio == "dub" and ep["has_dub"])):
+                servers = aw_get_servers(
+                    best["site_id"], ep["source_number"], audio)[:3]
+                if first_only:
+                    resolved = _fetch_first_source(aw_get_sources, servers)
+                    if resolved:
+                        server, url = resolved
+                        streams.append({
+                            "provider": "aniwaves",
+                            "server": server["server_name"],
+                            "url": url,
+                            "type": "hls",
+                            "quality": "auto",
+                            "referer": (
+                                f"{ANIWAVES_BASE}/watch/{best['slug']}/"
+                                f"ep-{ep['source_number']}"),
+                            "audio": audio,
+                        })
+                else:
+                    for server in servers:
+                        source = aw_get_sources(server["link_id"])
+                        url = source.get("url") if isinstance(source, dict) else None
+                        if url and url.startswith("http"):
+                            streams.append({
+                                "provider": "aniwaves",
+                                "server": server["server_name"],
+                                "url": url,
+                                "type": "hls",
+                                "quality": "auto",
+                                "referer": (
+                                    f"{ANIWAVES_BASE}/watch/{best['slug']}/"
+                                    f"ep-{ep['source_number']}"),
+                                "audio": audio,
+                            })
+    elif provider == "anikoto":
+        resolved = ak_resolve(
+            anilist_id, {"title": {"english": title}})
+        if resolved and resolved.get("show_id"):
+            eps = ak_get_episodes(resolved["show_id"])
+            ep = next((item for item in eps
+                       if item["number"] == source_episode), None)
+            if ep and ((audio == "sub" and ep["has_sub"])
+                       or (audio == "dub" and ep["has_dub"])):
+                servers = ak_get_servers(ep["ids"], audio)[:3]
+                if first_only:
+                    source_result = _fetch_first_source(
+                        ak_get_sources, servers)
+                    if source_result:
+                        server, url = source_result
+                        streams.append({
+                            "provider": "anikoto",
+                            "server": server["server_name"],
+                            "url": url,
+                            "type": "hls",
+                            "quality": "auto",
+                            "referer": f"{ANIKOTO_BASE}/watch/{resolved['slug']}",
+                            "audio": audio,
+                            "subtitle_type": server.get("subtitle_type"),
+                        })
+                else:
+                    for server in servers:
+                        url = ak_get_sources(server["link_id"])
+                        if url and url.startswith("http"):
+                            streams.append({
+                                "provider": "anikoto",
+                                "server": server["server_name"],
+                                "url": url,
+                                "type": "hls",
+                                "quality": "auto",
+                                "referer": f"{ANIKOTO_BASE}/watch/{resolved['slug']}",
+                                "audio": audio,
+                                "subtitle_type": server.get("subtitle_type"),
+                            })
+    elif provider == "2dhive" and mal_id:
+        if source_episode in hv_get_episodes(mal_id):
+            for server in hv_get_servers(mal_id, source_episode, audio):
+                if server["url"].startswith("http"):
+                    streams.append({
+                        "provider": "2dhive",
+                        "server": server["server_name"],
+                        "url": server["url"],
+                        "type": "hls",
+                        "quality": "auto",
+                        "referer": (
+                            f"{TWODHIVE_BASE}/episode?anime={mal_id}"
+                            f"&ep_num={source_episode}"),
+                        "audio": audio,
+                        "subtitle": server.get("subtitle"),
+                    })
+    return streams
+
+
+async def anihub_fetch_streams_by_tmdb(
+        tmdb_id: int, tmdb_season: int, tmdb_episode: int,
+        audio: str, client: httpx.AsyncClient,
+        first_only: bool = False) -> list:
+    """Find AniHub sources using the TMDB coordinates supplied by the caller."""
+    anilist_id, source_episode = await resolve_anihub_course(
+        tmdb_id, tmdb_season, tmdb_episode, client)
+    if anilist_id is None:
+        return []
+
+    metadata_key = f"anilist:metadata:{anilist_id}"
+    metadata = _get_cached_anihub(metadata_key) or {}
+    mapping = _get_anihub_mapping(anilist_id) or {}
+    title = mapping.get("title") or metadata.get("title")
+    mal_id = mapping.get("mal_id") or metadata.get("mal_id")
+    if not title or not mal_id:
+        try:
+            response = await client.post(
+                "https://graphql.anilist.co",
+                json={
+                    "query": (
+                        "query ($id: Int!) { Media(id: $id, type: ANIME) "
+                        "{ idMal title { english romaji native } } }"),
+                    "variables": {"id": anilist_id},
+                },
+                headers={"Content-Type": "application/json",
+                         "Accept": "application/json"},
+                timeout=httpx.Timeout(connect=3, read=6, write=3, pool=3))
+            if response.status_code == 200:
+                data = response.json()
+                media = ((data.get("data") or {}).get("Media") or {}) if isinstance(data, dict) else {}
+                titles = media.get("title") or {}
+                title = title or titles.get("english") or titles.get("romaji") or titles.get("native")
+                mal_id = mal_id or media.get("idMal")
+                if title and mal_id:
+                    _cache_anihub(metadata_key, {
+                        "title": title, "mal_id": mal_id})
+        except (httpx.HTTPError, ValueError):
+            _LOG.warning("AniList metadata unavailable for internal course %s",
+                         anilist_id)
+
+    if not title:
+        return []
+    provider_names = ["aniwaves", "anikoto", "2dhive"]
+    tasks = {
+        asyncio.create_task(asyncio.to_thread(
+            _fetch_anihub_provider, provider, anilist_id, source_episode,
+            audio, title, int(mal_id) if mal_id else None, first_only))
+        for provider in provider_names
+    }
+    if not first_only:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        streams = []
+        for provider, result in zip(provider_names, results):
+            if isinstance(result, Exception):
+                _LOG.warning("%s source lookup failed: %s", provider, result)
+            else:
+                streams.extend(result)
+        return streams
+
+    streams = []
+    pending = tasks
+    while pending:
+        completed, pending = await asyncio.wait(
+            pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in completed:
+            try:
+                streams.extend(task.result())
+            except Exception:
+                _LOG.warning("AniHub provider lookup failed", exc_info=True)
+        if streams:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            return streams
+    return streams
+
+
+def _filter_anihub_streams(
+        streams: list, server: Optional[str], dub: bool,
+        provider: Optional[str]) -> list:
+    filtered = []
+    provider_key = (provider or "").lower()
+    for stream in streams:
+        audio = stream.get("audio")
+        if server and audio != ("dub" if server.lower() == "aster" else "sub"):
+            continue
+        if not server and dub and audio != "dub":
+            continue
+        if not server and not dub and audio != "sub":
+            continue
+        source_provider = (stream.get("provider") or "").lower()
+        if provider_key and provider_key not in (
+                "anihub", source_provider, f"anihub:{source_provider}"):
+            continue
+        stream["server"] = "Aster" if audio == "dub" else "Vexa"
+        stream["provider"] = f"anihub:{source_provider or 'unknown'}"
+        filtered.append(stream)
+    priority = {"aniwaves": 0, "anikoto": 1, "2dhive": 2}
+    filtered.sort(key=lambda item: priority.get(
+        item["provider"].split(":")[-1], 99))
+    return filtered
 
 
 def map_vivarium_to_tmdb(vivarium_id: int) -> dict:
@@ -193,6 +819,7 @@ _CACHE = OrderedDict()  # (id,type,s,e,server,dub,provider,race) -> (at, result)
 _CACHE_TTL = 30
 _UPSTREAM_CACHE = OrderedDict()  # path -> (at, payload)
 _UPSTREAM_CACHE_TTL = 30
+_COURSE_CACHE_TTL = 1800
 _CACHE_LIMIT = 512
 _CACHE_LOCK = threading.Lock()
 _METRICS_LOCK = threading.Lock()
@@ -337,7 +964,6 @@ def parse_media_url(media_url: str) -> dict:
         return {
             "id": id_match.group(1), "type": content_type,
             "s": season, "e": episode,
-            "a": _link_query_value(query, "a"),
         }
 
     if host not in ("vivarium.su", "www.vivarium.su"):
@@ -352,7 +978,6 @@ def parse_media_url(media_url: str) -> dict:
         "type": "tv" if segments[0] == "s" else "movie",
         "s": _link_query_value(query, "s"),
         "e": _link_query_value(query, "e"),
-        "a": _link_query_value(query, "a"),
     }
 
 
@@ -374,58 +999,6 @@ async def resolve_media_url(media_url: str, season: Optional[str],
                  or int(media["e"]) < 1)):
         raise ValueError("Episode number (e) must be a positive integer")
 
-    ani_id = media["a"]
-    if ani_id and not media["s"]:
-        if not re.fullmatch(r"\d+", ani_id):
-            raise ValueError("AniList id (a) must be numeric")
-        if not media["e"]:
-            raise ValueError("TV links require an episode number (e)")
-
-        try:
-            response = await client.get(
-                f"{VIV}/api/cours", params={"id": media["id"]},
-                timeout=httpx.Timeout(connect=5, read=15, write=5, pool=5))
-        except httpx.HTTPError as ex:
-            raise RuntimeError(f"Vivarium course lookup failed: {ex}") from ex
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"Vivarium course lookup failed: {response.status_code}")
-        try:
-            payload = response.json()
-        except ValueError as ex:
-            raise RuntimeError("Vivarium returned invalid course data") from ex
-        courses = payload.get("cours") if isinstance(payload, dict) else None
-        if not isinstance(courses, list):
-            raise RuntimeError("Vivarium returned invalid course data")
-        course = next(
-            (item for item in courses
-             if isinstance(item, dict) and str(item.get("al")) == ani_id),
-            None)
-        if course is None:
-            raise ValueError(
-                f"AniList id {ani_id} is not mapped to this Vivarium title")
-
-        remaining = int(media["e"])
-        ranges = course.get("r")
-        if not isinstance(ranges, list):
-            raise RuntimeError("Vivarium returned invalid episode mapping data")
-        for episode_range in ranges:
-            if (not isinstance(episode_range, list) or len(episode_range) != 3
-                    or not all(str(value).isdigit()
-                               for value in episode_range)):
-                raise RuntimeError("Vivarium returned invalid episode mapping data")
-            tmdb_season, first_episode, last_episode = map(int, episode_range)
-            episode_count = last_episode - first_episode + 1
-            if tmdb_season < 0 or first_episode < 1 or episode_count < 1:
-                raise RuntimeError("Vivarium returned invalid episode mapping data")
-            if remaining <= episode_count:
-                media["s"] = str(tmdb_season)
-                media["e"] = str(first_episode + remaining - 1)
-                return media
-            remaining -= episode_count
-        raise ValueError(
-            f"Episode {media['e']} is outside AniList id {ani_id}'s episode range")
-
     return media
 
 
@@ -434,14 +1007,32 @@ async def resolve_media_url(media_url: str, season: Optional[str],
 # are classified into one of these two.
 SERVERS = [
     {"server": "Aster", "audio": "dub",
-     "description": "English dub anime"},
+     "description": "English dub anime",
+     "status": "configured", "availability": "per_title"},
     {"server": "Vexa", "audio": "japanese",
-     "description": "Japanese audio anime with English subtitles"},
+     "description": "Japanese audio anime with English subtitles",
+     "status": "configured", "availability": "per_title"},
 ]
 
 
 def is_dub(s: dict) -> bool:
-    return "dub" in (s.get("quality") or "").lower()
+    audio = str(s.get("audio") or "").lower()
+    audio_language = " ".join(str(s.get(key) or "") for key in (
+        "audio_language", "audioLanguage"))
+    return (audio in ("dub", "english", "eng", "en")
+            or "dub" in str(s.get("quality") or "").lower()
+            or bool(re.search(r"\b(?:english|eng|en)\b",
+                              audio_language, re.I)))
+
+
+def is_japanese_audio(s: dict) -> bool:
+    language = " ".join(str(s.get(key) or "") for key in (
+        "audio_language", "audioLanguage", "original_language"))
+    if language:
+        return bool(re.search(
+            r"\b(?:japanese|jpn|ja|jap)\b", language, re.I))
+    return (str(s.get("audio") or "").lower() in ("", "sub", "japanese")
+            and not is_dub(s))
 
 
 def has_english_subtitles(stream: dict) -> bool:
@@ -464,7 +1055,8 @@ def classify_streams(data: dict):
     aster = sorted([x for x in streams if is_dub(x)],
                    key=lambda x: x.get("rank", 0), reverse=True)
     vexa = sorted([x for x in streams
-                   if not is_dub(x) and has_english_subtitles(x)],
+                   if not is_dub(x) and is_japanese_audio(x)
+                   and has_english_subtitles(x)],
                   key=lambda x: (bool(x.get("subs")), x.get("rank", 0)),
                   reverse=True)
     return {"aster": aster, "vexa": vexa}
@@ -481,12 +1073,18 @@ def filter_streams(data: dict, dub: bool = False, provider: Optional[str] = None
         if server_key == "aster" and not is_dub(item):
             continue
         if server_key == "vexa" and (
-                is_dub(item) or not has_english_subtitles(item)):
+                is_dub(item) or not is_japanese_audio(item)
+                or not has_english_subtitles(item)):
             continue
         elif not server_key and dub and not is_dub(item):
             continue
+        elif not server_key and not dub and not (
+                is_dub(item) or (
+                    is_japanese_audio(item) and has_english_subtitles(item))):
+            continue
         if provider_key and (item.get("provider") or "").lower() != provider_key:
             continue
+        item["server"] = "Aster" if is_dub(item) else "Vexa"
         filtered.append(item)
 
     if server_key == "vexa":
@@ -524,8 +1122,10 @@ def wants_for(server_or_dub, s: dict) -> bool:
     if server_or_dub in ("aster", True):
         return is_dub(s)
     if server_or_dub in ("vexa",):
-        return not is_dub(s) and has_english_subtitles(s)
-    return True
+        return (not is_dub(s) and is_japanese_audio(s)
+                and has_english_subtitles(s))
+    return is_dub(s) or (
+        is_japanese_audio(s) and has_english_subtitles(s))
 
 
 async def _cached_upstream(client, path_qs: str, timings: dict):
@@ -691,7 +1291,25 @@ async def health_vivarium(request: Request):
         return {"status": 502, "result": "", "error": f"Upstream health failed: {ex}"}
     if response.status_code != 200:
         return {"status": response.status_code, "result": "", "error": "Upstream health failed"}
-    return {"status": 200, "result": response.json()}
+    try:
+        upstream_health = response.json()
+    except ValueError:
+        return {"status": 502, "result": "",
+                "error": "Upstream health returned invalid JSON"}
+    if not isinstance(upstream_health, dict):
+        return {"status": 502, "result": "",
+                "error": "Upstream health returned an invalid payload"}
+    return {
+        "status": 200,
+        "result": {
+            **upstream_health,
+            "upstream_status": "reachable",
+            "profiles": SERVERS,
+            "health_scope": (
+                "Profiles are configured; source availability is checked "
+                "per title and episode."),
+        },
+    }
 
 
 @app.get("/api/enc-vivarium", dependencies=[Depends(require_admin)])
@@ -752,19 +1370,18 @@ async def vivarium(
     if url and (id or type):
         return {"status": 400, "result": "",
                 "error": "Use either url or id and type, not both"}
+    client = request.app.state.http
     if url:
         try:
-            media = await resolve_media_url(
-                url, s, e, request.app.state.http)
+            media = await resolve_media_url(url, s, e, client)
         except ValueError as ex:
             return {"status": 400, "result": "", "error": str(ex)}
         except RuntimeError as ex:
             return {"status": 502, "result": "", "error": str(ex)}
-        id, type, s, e = (
-            media["id"], media["type"], media["s"], media["e"])
+        id, type, s, e = media["id"], media["type"], media["s"], media["e"]
     elif not id or not type:
         return {"status": 400, "result": "", "error": "Expected query: id, type",
-                "hint": "GET: /api/vivarium?url=[TMDB_or_Vivarium_link] or /api/vivarium?id=[tmdb_or_internal]&type=[movie|tv]&s=[season]&e=[episode]&server=[aster|vexa]"}
+            "hint": "GET: /api/vivarium?url=[TMDB_or_Vivarium_link] or /api/vivarium?id=[tmdb_or_internal]&type=[movie|tv]&s=[season]&e=[episode]&server=[aster|vexa]"}
     try:
         path = build_qs(id, type, s, e)
     except ValueError as ex:
@@ -790,22 +1407,75 @@ async def vivarium(
         return result
     timings = {"cache_lookup": cache_lookup_ms}
     client = request.app.state.http
+    tmdb_id = int(id)
+    tmdb_season = int(s) if s else 1
+    tmdb_episode = int(e) if e else 1
+    audio = "dub" if (server and server.lower() == "aster") or (dub and not server) else "sub"
+    anihub_race_completed = False
+    anihub_race_streams = []
     if race:
-        try:
-            won = await race_streams(
-                client, path, server.lower() if server else (True if dub else None),
-                provider, timings)
-        except (httpx.HTTPError, RuntimeError) as ex:
-            return {"status": 502, "result": "", "error": str(ex)}
-        if won:
-            started = time.perf_counter()
-            res = filter_streams({"streams": [won], "subtitles": []}, dub, provider, server)
-            res["streams"] = [stream for stream in res["streams"]
-                              if _usable_hls_stream(stream)]
-            res["qualities"] = quality_list(res["streams"])
-            if not res["streams"]:
-                _record_lookup(True)
-                return _no_sources_response()
+        vivarium_task = asyncio.create_task(race_streams(
+            client, path, server.lower() if server else (True if dub else None),
+            provider, timings))
+        pending = {vivarium_task}
+        if type == "tv":
+            anihub_task = asyncio.create_task(anihub_fetch_streams_by_tmdb(
+                tmdb_id, tmdb_season, tmdb_episode, audio, client,
+                first_only=True))
+            pending.add(anihub_task)
+        while pending:
+            completed, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED)
+
+            # Vivarium is the preferred source even when AniHub resolves first.
+            # Process its result first when both tasks complete together.
+            completed_tasks = sorted(
+                completed, key=lambda task: task is not vivarium_task)
+            for task in completed_tasks:
+                try:
+                    candidate = task.result()
+                except Exception:
+                    _LOG.warning("A source race participant failed",
+                                 exc_info=True)
+                    continue
+                if task is vivarium_task:
+                    if candidate:
+                        res = filter_streams(
+                            {"streams": [candidate], "subtitles": []},
+                            dub, provider, server)
+                        res["streams"] = [
+                            stream for stream in res["streams"]
+                            if _usable_hls_stream(stream)]
+                        res["qualities"] = quality_list(res["streams"])
+                    else:
+                        continue
+                    if not res["streams"]:
+                        continue
+                    for loser in pending:
+                        loser.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    _cache_put(_CACHE, key, res)
+                    _record_lookup(False)
+                    result = {"status": 200, "result": res}
+                    _log_timing(timings)
+                    return result
+                else:
+                    anihub_race_completed = True
+                    anihub_race_streams = candidate
+                    timings["anihub_ready"] = True
+        # Neither source returned a matching HLS stream; use the full response path.
+    try:
+        payload = await _cached_upstream(client, path, timings)
+    except (RuntimeError, httpx.HTTPError) as ex:
+        payload = None
+    if payload:
+        started = time.perf_counter()
+        res = filter_streams(payload, dub, provider, server)
+        res["streams"] = [stream for stream in res["streams"]
+                          if _usable_hls_stream(stream)]
+        res["qualities"] = quality_list(res["streams"])
+        if res["streams"]:
             timings["source_extraction"] = (time.perf_counter() - started) * 1000
             _cache_put(_CACHE, key, res)
             _record_lookup(False)
@@ -814,26 +1484,27 @@ async def vivarium(
             timings["response_generation"] = (time.perf_counter() - started) * 1000
             _log_timing(timings)
             return result
-        _record_lookup(True)
-        _log_timing(timings)
-        return _no_sources_response()
-    try:
-        payload = await _cached_upstream(client, path, timings)
-    except (RuntimeError, httpx.HTTPError) as ex:
-        return {"status": 502, "result": "", "error": str(ex)}
-    started = time.perf_counter()
-    res = filter_streams(payload, dub, provider, server)
-    res["streams"] = [stream for stream in res["streams"]
-                      if _usable_hls_stream(stream)]
-    res["qualities"] = quality_list(res["streams"])
-    if not res["streams"]:
-        _record_lookup(True)
-        return _no_sources_response()
-    timings["source_extraction"] = (time.perf_counter() - started) * 1000
-    _cache_put(_CACHE, key, res)
-    _record_lookup(False)
-    started = time.perf_counter()
-    result = {"status": 200, "result": res}
+    # Vivarium upstream returned no usable streams - try AniHub fallback
+    anihub_streams = []
+    if type == "tv":
+        anihub_streams = (
+            anihub_race_streams if anihub_race_completed
+            else await anihub_fetch_streams_by_tmdb(
+                tmdb_id, tmdb_season, tmdb_episode, audio, client))
+    if anihub_streams:
+        filtered = _filter_anihub_streams(anihub_streams, server, dub, provider)
+        if filtered:
+            res = {"streams": filtered, "subtitles": [], "qualities": quality_list(filtered)}
+            timings["anihub_fallback"] = True
+            _record_lookup(False)
+            started = time.perf_counter()
+            result = {"status": 200, "result": res}
+            timings["response_generation"] = (time.perf_counter() - started) * 1000
+            _log_timing(timings)
+            return result
+    _record_lookup(True)
+    _log_timing(timings)
+    return _no_sources_response()
     timings["response_generation"] = (time.perf_counter() - started) * 1000
     _log_timing(timings)
     return result

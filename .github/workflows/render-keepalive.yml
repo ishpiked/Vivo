@@ -28,8 +28,20 @@ jobs:
             echo "http_status=${status:-request_failed}"
             if [[ "${status}" == "200" ]] \
               && grep -Eq '"status"[[:space:]]*:[[:space:]]*"healthy"' <<< "${body}"; then
-              echo "health_payload=healthy"
-              exit 0
+              echo "api_health=healthy"
+              servers_response="$(curl --silent --show-error --max-time 30 \
+                --write-out $'\n%{http_code}' \
+                "${RENDER_HEALTH_URL%/}/api/servers")" || servers_response=""
+              servers_status="${servers_response##*$'\n'}"
+              servers_body="${servers_response%$'\n'*}"
+              if [[ "${servers_status}" == "200" ]] \
+                && jq -e '[.result.servers[].server] | index("Aster") != null and index("Vexa") != null' \
+                  <<< "${servers_body}" >/dev/null; then
+                echo "server_profiles=Aster,Vexa"
+                exit 0
+              fi
+              echo "The API is healthy, but Aster/Vexa profiles were not returned."
+              exit 1
             fi
             if [[ "${attempt}" -lt 3 ]]; then
               sleep 10
