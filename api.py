@@ -1848,33 +1848,39 @@ async def vivarium(
     anihub_race_completed = False
     anihub_race_streams = []
     if race:
-        vivarium_task = asyncio.create_task(race_streams(
+        race_started = time.perf_counter()
+
+        async def race_result(awaitable):
+            try:
+                result = await awaitable
+                return time.perf_counter(), result, None
+            except Exception as ex:
+                return time.perf_counter(), None, ex
+
+        vivarium_task = asyncio.create_task(race_result(race_streams(
             client, path, server.lower() if server else (True if dub else None),
-            provider, timings))
+            provider, timings)))
         pending = {vivarium_task}
         if type == "tv":
             requested_audio = (
                 "dub" if server and server.lower() == "aster"
                 else "sub" if server and server.lower() == "vexa"
                 else "dub" if dub else None)
-            anihub_task = asyncio.create_task(anihub_fetch_dual_audio_by_tmdb(
-                tmdb_id, tmdb_season, tmdb_episode, client,
-                first_only=True, requested_audio=requested_audio))
+            anihub_task = asyncio.create_task(race_result(
+                anihub_fetch_dual_audio_by_tmdb(
+                    tmdb_id, tmdb_season, tmdb_episode, client,
+                    first_only=True, requested_audio=requested_audio)))
             pending.add(anihub_task)
         while pending:
             completed, pending = await asyncio.wait(
                 pending, return_when=asyncio.FIRST_COMPLETED)
 
-            # Vivarium is the preferred source even when AniHub resolves first.
-            # Process its result first when both tasks complete together.
             completed_tasks = sorted(
-                completed, key=lambda task: task is not vivarium_task)
+                completed, key=lambda task: task.result()[0])
             for task in completed_tasks:
-                try:
-                    candidate = task.result()
-                except Exception:
-                    _LOG.warning("A source race participant failed",
-                                 exc_info=True)
+                finished_at, candidate, error = task.result()
+                if error is not None:
+                    _LOG.warning("A source race participant failed: %s", error)
                     continue
                 if task is vivarium_task:
                     if candidate:
@@ -1889,6 +1895,9 @@ async def vivarium(
                         continue
                     if not res["streams"]:
                         continue
+                    timings["race_winner"] = "vivarium"
+                    timings["race_winner_ms"] = (
+                        finished_at - race_started) * 1000
                     for loser in pending:
                         loser.cancel()
                     if pending:
@@ -1901,7 +1910,31 @@ async def vivarium(
                 else:
                     anihub_race_completed = True
                     anihub_race_streams = candidate
-                    timings["anihub_ready"] = True
+                    anihub_result = _filter_anihub_streams(
+                        candidate if isinstance(candidate, list) else [],
+                        server, dub, provider)
+                    anihub_result = [
+                        stream for stream in anihub_result
+                        if _usable_hls_stream(stream)]
+                    if not anihub_result:
+                        continue
+                    res = {
+                        "streams": anihub_result,
+                        "subtitles": [],
+                        "qualities": quality_list(anihub_result),
+                    }
+                    timings["race_winner"] = "anihub"
+                    timings["anihub_ready_ms"] = (
+                        finished_at - race_started) * 1000
+                    for loser in pending:
+                        loser.cancel()
+                    if pending:
+                        await asyncio.gather(
+                            *pending, return_exceptions=True)
+                    _record_lookup(False)
+                    result = {"status": 200, "result": res}
+                    _log_timing(timings)
+                    return result
         # Neither source returned a matching HLS stream; use the full response path.
     upstream_error = None
     try:

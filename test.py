@@ -29,7 +29,7 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
         self.client = AsyncMock()
         self.client.get.return_value = self.response
 
-    async def test_race_prefers_vivarium_when_anihub_finishes_first(self):
+    async def test_race_returns_first_valid_anihub_stream(self):
         vivarium_stream = {
             "url": "https://vivarium.example/actual.m3u8",
             "type": "hls",
@@ -41,12 +41,13 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
             "type": "hls",
             "quality": "1080p English Dub",
             "provider": "anihub:aniwaves",
+            "audio": "dub",
         }]
         request = Mock()
         request.app.state.http = self.client
 
         async def delayed_vivarium(*args, **kwargs):
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
             return vivarium_stream
 
         async def fast_anihub(*args, **kwargs):
@@ -66,10 +67,10 @@ class TmdbToAniHubMappingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response["status"], 200, response)
         self.assertEqual(
-            response["result"]["streams"][0]["provider"], "Vivarium Source")
-        self.assertEqual(
             response["result"]["streams"][0]["url"],
-            vivarium_stream["url"])
+            anihub_streams[0]["url"])
+        self.assertEqual(
+            response["result"]["streams"][0]["provider"], "anihub:aniwaves")
 
     async def test_returns_labeled_vivarium_profile_fallback(self):
         dub_stream = {

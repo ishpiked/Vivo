@@ -58,25 +58,22 @@ on Vivarium's current providers and availability.
 ## AniHub and Vivarium source race
 
 By default, the existing `/api/vivarium` endpoint checks Vivarium and AniHub
-in parallel, but prefers a matching usable Vivarium source even if AniHub
-finishes first. AniHub is only returned as a fallback when Vivarium has no
-usable matching HLS source. Callers only provide a TMDB ID and, for TV, TMDB
+in parallel and returns whichever produces the first matching, usable HLS
+source. Callers only provide a TMDB ID and, for TV, TMDB
 season and episode; AniList identifiers are resolved internally from
 Vivarium's `/api/cours` ranges.
 
-AniHub's Japanese-sub and English-dub searches run concurrently. Their results
-are returned through the **same `/api/vivarium` endpoint** with only two public
-server labels: **Aster** for English-dub audio and **Vexa** for Japanese audio
-with English subtitles. Internal AniHub/Vivarium provider names are never
-exposed as additional servers.
+AniHub searches the requested audio profile (or both concurrently when no
+profile is requested). Results are returned through the **same `/api/vivarium`
+endpoint** with only two public server labels: **Aster** for English-dub audio
+and **Vexa** for Japanese audio with English subtitles. Internal
+AniHub/Vivarium provider names are never exposed as additional servers.
 
 The AniHub scraper resolves the course once, then probes AniWaves, Anikoto,
-and 2dhive concurrently. In the default mode its result is held as a fallback
-while Vivarium's server-sent event lookup checks for its own first matching
-source. If neither Vivarium lookup yields a usable stream, AniHub can still
-serve as a fallback. AniHub fallback responses are not cached as the preferred
-result, so later requests recheck Vivarium. A 404 still means neither source
-produced a usable matching HLS link for that request; stream availability
+and 2dhive concurrently. The first result is returned only after it matches
+the requested audio profile and is a usable HLS link; the slower source is
+cancelled where possible. A 404 still means neither source produced a usable
+matching HLS link for that request; stream availability
 cannot be guaranteed when upstream providers have no working source.
 
 The optional `anilist_tmdb_mapping.json` file only supplies AniHub title/MAL
